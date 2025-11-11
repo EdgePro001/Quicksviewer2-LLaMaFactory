@@ -1,0 +1,15 @@
+{
+  "_from_model_config": true,
+  "do_sample": true,
+  "eos_token_id": [
+    151329,
+    151336,
+    151338,
+    151348
+  ],
+  "pad_token_id": 151329,
+  "top_p": 0.6,
+  "temperature": 0.8,
+  "top_k": 2,
+  "transformers_version": "4.57.1"
+}

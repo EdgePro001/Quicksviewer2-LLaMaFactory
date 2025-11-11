@@ -35,6 +35,7 @@ from .model_utils.quantization import configure_quantization
 from .model_utils.rope import configure_rope
 from .model_utils.valuehead import prepare_valuehead_model
 from .model_utils.visual import autocast_projector_dtype, configure_visual_model
+from .glm4v_cubing import Glm4vForConditionalGeneration
 
 
 if TYPE_CHECKING:
@@ -209,6 +210,37 @@ def patch_model(
     except Exception as e:
         logger.warning_rank0(f"[sdpa_npu_redirect] Failed to enable redirect, will keep native SDPA. Reason: {e}")
     # =====================================================================================
+
+    if isinstance(model, Glm4vForConditionalGeneration) and is_trainable:
+        logger.info_rank0("=" * 50)
+        logger.info_rank0("Freezing GLM4V model for Cubing-only training...")
+        
+        # Step 1: Freeze所有参数
+        for param in model.parameters():
+            param.requires_grad = False
+        
+        # Step 2: 只解冻 Cubing 和 Resampler
+        trainable_modules = []
+        
+        if hasattr(model.model, 'cubing_module'):
+            for param in model.model.cubing_module.parameters():
+                param.requires_grad = True
+            trainable_modules.append("cubing_module")
+        
+        if hasattr(model.model, 'resampler'):
+            for param in model.model.resampler.parameters():
+                param.requires_grad = True
+            trainable_modules.append("resampler")
+        
+        # 统计可训练参数
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        all_params = sum(p.numel() for p in model.parameters())
+        
+        logger.info_rank0(f"✅ Unfrozen modules: {', '.join(trainable_modules)}")
+        logger.info_rank0(f"📊 Trainable params: {trainable_params:,} / {all_params:,} "
+                         f"({100 * trainable_params / all_params:.2f}%)")
+        logger.info_rank0("=" * 50)
+    
 
     try:
         model.add_model_tags(["llama-factory"])

@@ -1,0 +1,54 @@
+### model
+model_name_or_path: /home/mjx/LLaMA-Factory/models/glm4v-cubing
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_trainable_layers: 64  # 冻结前64层（24个visual blocks + 40个language layers）
+freeze_trainable_modules: visual,language_model,lm_head  # 明确冻结这些模块
+
+### dataset
+dataset: sharegpt_video_114k
+template: glm4v
+cutoff_len: 8192
+max_samples: 10
+overwrite_cache: true
+preprocessing_num_workers: 2
+
+### output
+output_dir: saves/glm4v_cubing_sharegpt_test
+logging_steps: 1
+save_steps: 10
+save_total_limit: 2
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-4
+num_train_epochs: 5
+lr_scheduler_type: cosine
+warmup_steps: 5
+bf16: true
+ddp_timeout: 180000000
+dataloader_num_workers: 4
+remove_unused_columns: false
+
+### eval
+val_size: 0.2
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 10
+do_eval: true
+
+### optimization
+gradient_checkpointing: true
+optim: adamw_torch
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+### logging
+report_to: tensorboard
+logging_first_step: true

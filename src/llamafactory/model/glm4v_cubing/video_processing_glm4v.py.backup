@@ -1,0 +1,315 @@
+# video_processing_glm4v.py
+"""
+GLM4V Video Processor with Cubing support
+Handles video-specific preprocessing: batching, temporal alignment, etc.
+"""
+
+import torch
+import torch.nn.functional as F
+from typing import List, Optional, Union, Tuple, Dict
+from PIL import Image
+
+from transformers.image_processing_utils import BatchFeature
+from transformers.image_utils import (
+    ChannelDimension,
+    PILImageResampling,
+    to_channel_dimension_format,
+)
+from transformers.utils import TensorType
+
+from .image_processing_glm4v import Glm4vCubingImageProcessor
+
+
+def group_videos_by_shape(videos: List[torch.Tensor]) -> Tuple[Dict, List]:
+    """
+    按形状分组视频以便批处理
+    
+    Args:
+        videos: List of [T, C, H, W] tensors
+    
+    Returns:
+        grouped_videos: {shape: [video1, video2, ...]}
+        grouped_indices: 原始顺序索引
+    """
+    grouped = {}
+    indices = {}
+    
+    for idx, video in enumerate(videos):
+        shape = tuple(video.shape)  # (T, C, H, W)
+        if shape not in grouped:
+            grouped[shape] = []
+            indices[shape] = []
+        grouped[shape].append(video)
+        indices[shape].append(idx)
+    
+    return grouped, indices
+
+
+def reorder_videos(grouped_videos: Dict, grouped_indices: Dict) -> List:
+    """
+    按原始顺序重组视频
+    """
+    flat_videos = []
+    flat_indices = []
+    
+    for shape, videos in grouped_videos.items():
+        flat_videos.extend(videos)
+        flat_indices.extend(grouped_indices[shape])
+    
+    # 按原始索引排序
+    sorted_pairs = sorted(zip(flat_indices, flat_videos))
+    return [video for _, video in sorted_pairs]
+
+
+class Glm4vVideoProcessor(Glm4vCubingImageProcessor):
+    """
+    Video-specific processor extending ImageProcessor
+    
+    Handles:
+    - Batch processing of video frames
+    - Temporal dimension alignment
+    - Efficient memory usage
+    """
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # 视频特定参数可以在这里添加
+    
+    def preprocess_videos(
+        self,
+        videos: Union[List[List[Image.Image]], List[torch.Tensor]],
+        do_resize: Optional[bool] = None,
+        size: Optional[dict] = None,
+        resample: Optional[PILImageResampling] = None,
+        do_rescale: Optional[bool] = None,
+        rescale_factor: Optional[float] = None,
+        do_normalize: Optional[bool] = None,
+        image_mean: Optional[Union[float, List[float]]] = None,
+        image_std: Optional[Union[float, List[float]]] = None,
+        patch_size: Optional[int] = None,
+        temporal_patch_size: Optional[int] = None,
+        merge_size: Optional[int] = None,
+        return_tensors: Optional[Union[str, TensorType]] = None,
+        **kwargs,
+    ) -> BatchFeature:
+        """
+        批量处理视频
+        
+        Args:
+            videos: List of videos, each video is:
+                - List[PIL.Image]: List of frames
+                - torch.Tensor: [T, C, H, W] tensor
+        
+        Returns:
+            BatchFeature with:
+                - pixel_values_videos: [total_patches, feature_dim]
+                - video_grid_thw: [[t, h, w], ...]
+        """
+        # 参数默认值
+        do_resize = do_resize if do_resize is not None else self.do_resize
+        size = size if size is not None else self.size
+        resample = resample if resample is not None else self.resample
+        do_rescale = do_rescale if do_rescale is not None else self.do_rescale
+        rescale_factor = rescale_factor if rescale_factor is not None else self.rescale_factor
+        do_normalize = do_normalize if do_normalize is not None else self.do_normalize
+        image_mean = image_mean if image_mean is not None else self.image_mean
+        image_std = image_std if image_std is not None else self.image_std
+        patch_size = patch_size if patch_size is not None else self.patch_size
+        temporal_patch_size = temporal_patch_size if temporal_patch_size is not None else self.temporal_patch_size
+        merge_size = merge_size if merge_size is not None else self.merge_size
+        
+        # 转换为torch.Tensor格式
+        videos_tensors = []
+        for video in videos:
+            if isinstance(video, list):
+                # List[PIL.Image] → torch.Tensor
+                video_tensor = self._frames_to_tensor(video)
+            else:
+                video_tensor = video
+            videos_tensors.append(video_tensor)
+        
+        # 🔑 按形状分组
+        grouped_videos, grouped_indices = group_videos_by_shape(videos_tensors)
+        
+        processed_videos_grouped = {}
+        processed_grids = {}
+        
+        # 🔑 批量处理每组
+        for shape, video_batch in grouped_videos.items():
+            processed, grids = self._process_video_batch(
+                video_batch,
+                do_resize=do_resize,
+                size=size,
+                resample=resample,
+                do_rescale=do_rescale,
+                rescale_factor=rescale_factor,
+                do_normalize=do_normalize,
+                image_mean=image_mean,
+                image_std=image_std,
+                patch_size=patch_size,
+                temporal_patch_size=temporal_patch_size,
+                merge_size=merge_size,
+            )
+            processed_videos_grouped[shape] = processed
+            processed_grids[shape] = grids
+        
+        # 恢复原始顺序
+        processed_videos = reorder_videos(processed_videos_grouped, grouped_indices)
+        processed_grids = reorder_videos(processed_grids, grouped_indices)
+        
+        # 拼接所有视频
+        pixel_values_videos = torch.cat(processed_videos, dim=0)
+        video_grid_thw = torch.tensor(processed_grids, dtype=torch.long)
+        
+        data = {
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+        }
+        
+        return BatchFeature(data=data, tensor_type=return_tensors)
+    
+    def _frames_to_tensor(self, frames: List[Image.Image]) -> torch.Tensor:
+        """
+        将PIL图像列表转为tensor
+        
+        Args:
+            frames: List of PIL.Image
+        
+        Returns:
+            torch.Tensor: [T, C, H, W]
+        """
+        import numpy as np
+        
+        # 转为numpy数组
+        frames_np = [np.array(frame) for frame in frames]
+        frames_np = np.stack(frames_np)  # [T, H, W, C]
+        
+        # 转为torch并调整维度
+        frames_tensor = torch.from_numpy(frames_np)
+        frames_tensor = frames_tensor.permute(0, 3, 1, 2)  # [T, C, H, W]
+        
+        return frames_tensor.float()
+    
+    def _process_video_batch(
+        self,
+        video_batch: List[torch.Tensor],
+        do_resize: bool,
+        size: dict,
+        resample: PILImageResampling,
+        do_rescale: bool,
+        rescale_factor: float,
+        do_normalize: bool,
+        image_mean: Union[float, List[float]],
+        image_std: Union[float, List[float]],
+        patch_size: int,
+        temporal_patch_size: int,
+        merge_size: int,
+    ) -> Tuple[List[torch.Tensor], List[List[int]]]:
+        """
+        处理相同形状的视频批次
+        
+        Args:
+            video_batch: List of [T, C, H, W] tensors (same shape)
+        
+        Returns:
+            processed_videos: List of [N_patches, feature_dim]
+            grids: List of [t, h, w]
+        """
+        # Stack成batch
+        stacked = torch.stack(video_batch)  # [B, T, C, H, W]
+        B, T, C, H, W = stacked.shape
+        
+        # 🔑 Resize (批量处理)
+        if do_resize:
+            from .image_processing_glm4v import smart_resize
+            resized_h, resized_w = smart_resize(
+                num_frames=T,
+                height=H,
+                width=W,
+                temporal_factor=temporal_patch_size,
+                factor=patch_size * merge_size,
+                min_pixels=size["shortest_edge"],
+                max_pixels=size["longest_edge"],
+            )
+            # 当作 B*T 张图片一次性resize
+            stacked = stacked.view(B * T, C, H, W)
+            stacked = self._resize_tensor(stacked, resized_h, resized_w, resample)
+            stacked = stacked.view(B, T, C, resized_h, resized_w)
+            H, W = resized_h, resized_w
+        
+        # 🔑 Rescale & Normalize (批量处理)
+        if do_rescale:
+            stacked = stacked * rescale_factor
+        
+        if do_normalize:
+            mean = torch.tensor(image_mean).view(1, 1, -1, 1, 1)
+            std = torch.tensor(image_std).view(1, 1, -1, 1, 1)
+            stacked = (stacked - mean) / std
+        
+        # 🔑 Temporal对齐
+        if T % temporal_patch_size != 0:
+            pad_frames = temporal_patch_size - (T % temporal_patch_size)
+            # 重复最后一帧
+            last_frames = stacked[:, -1:].repeat(1, pad_frames, 1, 1, 1)
+            stacked = torch.cat([stacked, last_frames], dim=1)
+            T = stacked.shape[1]
+        
+        # 🔑 Reshape成patch格式
+        grid_t = T // temporal_patch_size
+        grid_h = H // patch_size
+        grid_w = W // patch_size
+        
+        # Reshape: [B, T, C, H, W] → [B, grid_t, grid_h, grid_w, patch_features]
+        patches = stacked.view(
+            B,
+            grid_t, temporal_patch_size,
+            C,
+            grid_h // merge_size, merge_size, patch_size,
+            grid_w // merge_size, merge_size, patch_size,
+        )
+        # Permute: [B, grid_t, grid_h_merged, grid_w_merged, merge, merge, C, temp_patch, patch, patch]
+        patches = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+        
+        # Flatten: [B, grid_t*grid_h*grid_w, C*temp_patch*patch*patch]
+        feature_dim = C * temporal_patch_size * patch_size * patch_size
+        patches = patches.reshape(B, grid_t * grid_h * grid_w, feature_dim)
+        
+        # 拆分回List
+        processed_videos = list(patches)
+        grids = [[grid_t, grid_h, grid_w]] * B
+        
+        return processed_videos, grids
+    
+    def _resize_tensor(
+        self, 
+        tensor: torch.Tensor, 
+        height: int, 
+        width: int, 
+        resample: PILImageResampling
+    ) -> torch.Tensor:
+        """
+        Resize tensor using torch.nn.functional.interpolate
+        
+        Args:
+            tensor: [N, C, H, W]
+            height, width: target size
+        
+        Returns:
+            Resized tensor [N, C, height, width]
+        """
+        mode_map = {
+            PILImageResampling.BILINEAR: 'bilinear',
+            PILImageResampling.BICUBIC: 'bicubic',
+            PILImageResampling.NEAREST: 'nearest',
+        }
+        mode = mode_map.get(resample, 'bicubic')
+        
+        return F.interpolate(
+            tensor,
+            size=(height, width),
+            mode=mode,
+            align_corners=False if mode != 'nearest' else None
+        )
+
+
+__all__ = ["Glm4vVideoProcessor"]

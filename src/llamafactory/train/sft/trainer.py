@@ -92,6 +92,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
             verify_fp8_status(self.accelerator, model_args)
 
+        self.model_args = model_args
+
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -115,6 +117,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
         return super().compute_loss(model, inputs, *args, **kwargs)
+    
+    @override
+    def training_step(self, model, inputs, num_items_in_batch):
+        # ✨ Gumbel 温度退火
+        if self.model_args is not None and hasattr(model, 'model') and hasattr(model.model, 'set_gumbel_noise'):
+            current_step = self.state.global_step
+            max_steps = self.state.max_steps if self.state.max_steps > 0 else self.args.max_steps
+            
+            # 线性退火：1.0 → 0.001
+            lr_gumbel = 1.0 - (1.0 - 0.001) * min(current_step / max_steps, 1.0)
+            model.model.set_gumbel_noise(lr_gumbel)
+    
+        return super().training_step(model, inputs, num_items_in_batch)
 
     @override
     def prediction_step(

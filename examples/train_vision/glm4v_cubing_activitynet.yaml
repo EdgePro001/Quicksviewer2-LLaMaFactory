@@ -1,0 +1,53 @@
+### model
+# model_name_or_path: /home/mjx/LLaMA-Factory/models/glm4v-cubing
+model_name_or_path: /home/mjx/LLaMA-Factory/saves/glm4v_cubing_activitynet_test
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: activitynet_llamafactory
+template: glm4v
+cutoff_len: 8192
+max_samples: 10  # 减少到10个样本用于快速测试
+overwrite_cache: true
+preprocessing_num_workers: 2  # 减少worker数
+
+### output
+output_dir: saves/glm4v_cubing_activitynet_test2
+logging_steps: 1
+save_steps: 10
+save_total_limit: 2  # 只保留2个checkpoint
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1  # 减少累积，加快迭代（有效batch=2）
+learning_rate: 1.0e-4  # 略微降低学习率
+num_train_epochs: 5  # 50个epoch
+lr_scheduler_type: cosine
+warmup_steps: 5  # 减少warmup
+bf16: true
+ddp_timeout: 180000000
+dataloader_num_workers: 4
+remove_unused_columns: false
+
+### eval
+val_size: 0.2  # 20%验证集（10样本→2个验证）
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 20  # 与save_steps对齐
+do_eval: true
+
+### optimization
+gradient_checkpointing: true
+optim: adamw_torch
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+### logging
+report_to: tensorboard
+logging_first_step: true

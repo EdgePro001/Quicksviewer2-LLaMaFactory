@@ -730,5 +730,21 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "activitynet_llamafactory": {
+    "file_name": "activitynet_llamafactory.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "videos": "videos"
+    }
+  },
+  "sharegpt_video_114k": {
+    "file_name": "sharegpt_available_llamafactory.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "videos": "videos"
+    }
   }
 }

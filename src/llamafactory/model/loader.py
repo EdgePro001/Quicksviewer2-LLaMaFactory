@@ -37,7 +37,7 @@ from .model_utils.mod import convert_pretrained_model_to_mod, load_mod_pretraine
 from .model_utils.unsloth import load_unsloth_pretrained_model
 from .model_utils.valuehead import load_valuehead_params
 from .patcher import patch_config, patch_model, patch_processor, patch_tokenizer, patch_valuehead_model
-
+from .glm4v_cubing import Glm4vForConditionalGeneration, Glm4vConfig
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
@@ -156,26 +156,38 @@ def load_model(
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
         else:
-            if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
-                load_class = AutoModelForImageTextToText
-            elif type(config) in AutoModelForVision2Seq._model_mapping.keys():  # image-text
-                load_class = AutoModelForVision2Seq
-            elif type(config) in AutoModelForSeq2SeqLM._model_mapping.keys():  # audio-text
-                load_class = AutoModelForSeq2SeqLM
-            elif type(config) in AutoModelForTextToWaveform._model_mapping.keys():  # audio hack for qwen omni
-                load_class = AutoModelForTextToWaveform
+            # Check if this is a GLM4V model
+            model_name_lower = model_args.model_name_or_path.lower()
+            is_glm4v = "glm-4v" in model_name_lower or "glm4v" in model_name_lower
+            
+            if is_glm4v:
+                # Load GLM4V with Cubing
+                if model_args.train_from_scratch:
+                    model = Glm4vForConditionalGeneration(config)
+                else:
+                    model = Glm4vForConditionalGeneration.from_pretrained(**init_kwargs)
             else:
-                load_class = AutoModelForCausalLM
+                # Original model loading logic
+                if type(config) in AutoModelForImageTextToText._model_mapping.keys():
+                    load_class = AutoModelForImageTextToText
+                elif type(config) in AutoModelForVision2Seq._model_mapping.keys():
+                    load_class = AutoModelForVision2Seq
+                elif type(config) in AutoModelForSeq2SeqLM._model_mapping.keys():
+                    load_class = AutoModelForSeq2SeqLM
+                elif type(config) in AutoModelForTextToWaveform._model_mapping.keys():
+                    load_class = AutoModelForTextToWaveform
+                else:
+                    load_class = AutoModelForCausalLM
 
-            if model_args.train_from_scratch:
-                model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
-            else:
-                model = load_class.from_pretrained(**init_kwargs)
-                if getattr(model.config, "model_type", None) in ["qwen2_5_omni", "qwen3_omni_moe"]:
-                    model = getattr(model, "thinker")
+                if model_args.train_from_scratch:
+                    model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
+                else:
+                    model = load_class.from_pretrained(**init_kwargs)
+                    if getattr(model.config, "model_type", None) in ["qwen2_5_omni", "qwen3_omni_moe"]:
+                        model = getattr(model, "thinker")
 
-        if model_args.mixture_of_depths == "convert":
-            model = convert_pretrained_model_to_mod(model, config, model_args)
+    if model_args.mixture_of_depths == "convert":
+        model = convert_pretrained_model_to_mod(model, config, model_args)
 
     if not lazy_load:
         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)

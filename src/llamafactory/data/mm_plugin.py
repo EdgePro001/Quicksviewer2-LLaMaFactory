@@ -248,13 +248,13 @@ class MMPluginMixin:
         self, video_stream: "Stream", video_fps: float, video_maxlen: int, **kwargs
     ) -> list[int]:
         r"""Compute video sample indices according to fps."""
-        total_frames = video_stream.frames
-        if total_frames == 0:  # infinite video
+        total_num_frames = video_stream.frames
+        if total_num_frames == 0:  # infinite video
             return np.linspace(0, video_maxlen - 1, video_maxlen).astype(np.int32)
 
         sample_frames = max(1, math.floor(float(video_stream.duration * video_stream.time_base) * video_fps))
-        sample_frames = min(total_frames, video_maxlen, sample_frames)
-        return np.linspace(0, total_frames - 1, sample_frames).astype(np.int32)
+        sample_frames = min(total_num_frames, video_maxlen, sample_frames)
+        return np.linspace(0, total_num_frames - 1, sample_frames).astype(np.int32)
 
     def _regularize_images(self, images: list["ImageInput"], **kwargs) -> "RegularizedImageOutput":
         r"""Regularize images to avoid error. Including reading and pre-processing."""
@@ -1704,12 +1704,91 @@ class GLM4VPlugin(Qwen2VLPlugin):
             )
             # prepare video metadata
             video_metadata = [
-                {"fps": 2, "duration": duration, "total_frames": len(video)}
+                {"fps": 2, "duration": duration, "total_num_frames": len(video)}
                 for video, duration in zip(video_data["videos"], video_data["durations"])
             ]
             mm_inputs.update(video_processor(images=None, videos=video_data["videos"], video_metadata=video_metadata))
 
         return mm_inputs
+
+    # @override
+    # def process_messages(
+    #     self,
+    #     messages: list[dict[str, str]],
+    #     images: list["ImageInput"],
+    #     videos: list["VideoInput"],
+    #     audios: list["AudioInput"],
+    #     processor: Optional["MMProcessor"],
+    # ) -> list[dict[str, str]]:
+    #     self._validate_input(processor, images, videos, audios)
+    #     self._validate_messages(messages, images, videos, audios)
+    #     num_image_tokens, num_video_tokens = 0, 0
+    #     messages = deepcopy(messages)
+    #     image_processor: BaseImageProcessor = getattr(processor, "image_processor")
+
+    #     merge_length: int = getattr(image_processor, "merge_size") ** 2
+    #     if self.expand_mm_tokens:
+    #         mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
+    #         image_grid_thw = mm_inputs.get("image_grid_thw", [])
+    #         video_grid_thw = mm_inputs.get("video_grid_thw", [])
+    #         num_frames = video_grid_thw[0][0] if len(video_grid_thw) > 0 else 0  # hard code for now
+    #         timestamps = mm_inputs.get("timestamps", [])
+
+    #         if hasattr(timestamps, "tolist"):
+    #             timestamps = timestamps.tolist()
+
+    #         if not timestamps:
+    #             timestamps_list = []
+    #         elif isinstance(timestamps[0], list):
+    #             timestamps_list = timestamps[0]
+    #         else:
+    #             timestamps_list = timestamps
+
+    #         unique_timestamps = timestamps_list.copy()
+    #         selected_timestamps = unique_timestamps[:num_frames]
+    #         while len(selected_timestamps) < num_frames:
+    #             selected_timestamps.append(selected_timestamps[-1] if selected_timestamps else 0)
+
+    #     else:
+    #         image_grid_thw = [None] * len(images)
+    #         video_grid_thw = [None] * len(videos)
+    #         num_frames = 0
+    #         selected_timestamps = [0]
+
+    #     for message in messages:
+    #         content = message["content"]
+    #         while IMAGE_PLACEHOLDER in content:
+    #             image_seqlen = image_grid_thw[num_image_tokens].prod() // merge_length if self.expand_mm_tokens else 1
+    #             content = content.replace(
+    #                 IMAGE_PLACEHOLDER, f"<|begin_of_image|>{self.image_token * image_seqlen}<|end_of_image|>", 1
+    #             )
+    #             num_image_tokens += 1
+
+    #         while VIDEO_PLACEHOLDER in content:
+    #             video_structure = ""
+    #             print(f"[DEBUG plugin] num_frames: {num_frames}")
+    #             for frame_index in range(num_frames):
+    #                 video_seqlen = (
+    #                     video_grid_thw[num_video_tokens][1:].prod() // merge_length if self.expand_mm_tokens else 1
+    #                 )
+    #                 print(f"[DEBUG plugin] video_seqlen: {video_seqlen}")
+    #                 timestamp_sec = selected_timestamps[frame_index]
+    #                 frame_structure = (
+    #                     f"<|begin_of_image|>{self.image_token * video_seqlen}<|end_of_image|>{timestamp_sec}"
+    #                 )
+    #                 video_structure += frame_structure
+
+    #             if not self.expand_mm_tokens:
+    #                 video_structure = self.video_token
+
+    #             content = content.replace(VIDEO_PLACEHOLDER, f"<|begin_of_video|>{video_structure}<|end_of_video|>", 1)
+    #             num_video_tokens += 1
+
+    #         message["content"] = content
+
+    #     return messages
+
+    # Inside GLM4VPlugin class
 
     @override
     def process_messages(
@@ -1721,66 +1800,59 @@ class GLM4VPlugin(Qwen2VLPlugin):
         processor: Optional["MMProcessor"],
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
-        self._validate_messages(messages, images, videos, audios)
-        num_image_tokens, num_video_tokens = 0, 0
+        # We still need _validate_messages to ensure #videos == #placeholders initially
+        self._validate_messages(messages, images, videos, audios) # Use the version checking self.video_token
+
+        num_image_tokens = 0
         messages = deepcopy(messages)
+        # image_processor: BaseImageProcessor = getattr(processor, "image_processor") # Not needed now for seqlen
+
+        # --- Simplified Image Placeholder Handling (Assume Native Logic Still Needed for Image Tokens) ---
+        # NOTE: If images also need dynamic insertion, this part needs changing too.
+        # Assuming image expansion logic remains for now based on Native GLM4V.
+        # Recalculate merge_length if needed
         image_processor: BaseImageProcessor = getattr(processor, "image_processor")
-
-        merge_length: int = getattr(image_processor, "merge_size") ** 2
-        if self.expand_mm_tokens:
-            mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
-            image_grid_thw = mm_inputs.get("image_grid_thw", [])
-            video_grid_thw = mm_inputs.get("video_grid_thw", [])
-            num_frames = video_grid_thw[0][0] if len(video_grid_thw) > 0 else 0  # hard code for now
-            timestamps = mm_inputs.get("timestamps", [])
-
-            if hasattr(timestamps, "tolist"):
-                timestamps = timestamps.tolist()
-
-            if not timestamps:
-                timestamps_list = []
-            elif isinstance(timestamps[0], list):
-                timestamps_list = timestamps[0]
-            else:
-                timestamps_list = timestamps
-
-            unique_timestamps = timestamps_list.copy()
-            selected_timestamps = unique_timestamps[:num_frames]
-            while len(selected_timestamps) < num_frames:
-                selected_timestamps.append(selected_timestamps[-1] if selected_timestamps else 0)
-
-        else:
-            image_grid_thw = [None] * len(images)
-            video_grid_thw = [None] * len(videos)
-            num_frames = 0
-            selected_timestamps = [0]
+        merge_length: int = getattr(image_processor, "merge_size", 2) ** 2 # Default merge_size=2 if not found
+        image_grid_thw = []
+        if self.expand_mm_tokens and (len(images) > 0): # Only get mm_inputs if needed for images
+            try:
+                # Get image grid info ONLY if expanding image tokens
+                mm_inputs = self._get_mm_inputs(images, [], [], processor) # Only process images
+                image_grid_thw = mm_inputs.get("image_grid_thw", [])
+            except Exception as e:
+                print(f"[ERROR PLUGIN] Failed to get image inputs for expansion: {e}")
+                # Handle error or fallback
 
         for message in messages:
             content = message["content"]
             while IMAGE_PLACEHOLDER in content:
-                image_seqlen = image_grid_thw[num_image_tokens].prod() // merge_length if self.expand_mm_tokens else 1
+                image_seqlen = 1 # Default if not expanding or error
+                if self.expand_mm_tokens and num_image_tokens < len(image_grid_thw):
+                    try:
+                        # Calculate based on grid, same as before
+                        image_seqlen = image_grid_thw[num_image_tokens].prod() // merge_length
+                    except Exception as e:
+                        print(f"[WARNING PLUGIN] Error calculating image_seqlen for image {num_image_tokens}: {e}. Using default 1.")
+                        image_seqlen = 1
+                elif self.expand_mm_tokens:
+                    print(f"[WARNING PLUGIN] More image placeholders found than image grids available ({num_image_tokens} >= {len(image_grid_thw)}). Using default seqlen 1.")
+                    image_seqlen = 1
+
                 content = content.replace(
                     IMAGE_PLACEHOLDER, f"<|begin_of_image|>{self.image_token * image_seqlen}<|end_of_image|>", 1
                 )
                 num_image_tokens += 1
 
-            while VIDEO_PLACEHOLDER in content:
-                video_structure = ""
-                for frame_index in range(num_frames):
-                    video_seqlen = (
-                        video_grid_thw[num_video_tokens][1:].prod() // merge_length if self.expand_mm_tokens else 1
-                    )
-                    timestamp_sec = selected_timestamps[frame_index]
-                    frame_structure = (
-                        f"<|begin_of_image|>{self.image_token * video_seqlen}<|end_of_image|>{timestamp_sec}"
-                    )
-                    video_structure += frame_structure
-
-                if not self.expand_mm_tokens:
-                    video_structure = self.video_token
-
-                content = content.replace(VIDEO_PLACEHOLDER, f"<|begin_of_video|>{video_structure}<|end_of_video|>", 1)
-                num_video_tokens += 1
+            # --- Simplified Video Placeholder Handling ---
+            # ✨ Just replace the placeholder string with the single video token string
+            #    Do NOT repeat based on calculated length.
+            if VIDEO_PLACEHOLDER in content and self.video_token:
+                print(f"[DEBUG PLUGIN SIMPLE] Replacing '{VIDEO_PLACEHOLDER}' with single '{self.video_token}'")
+                # We simply ensure the correct token string is present, the model will handle expansion
+                content = content.replace(VIDEO_PLACEHOLDER, self.video_token, 1)
+            elif VIDEO_PLACEHOLDER in content:
+                print(f"[WARNING PLUGIN SIMPLE] Found '{VIDEO_PLACEHOLDER}' but self.video_token is not set.")
+                # Fallback or error handling needed
 
             message["content"] = content
 
