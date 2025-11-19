@@ -1,6 +1,6 @@
 ### model
-# model_name_or_path: /home/mjx/LLaMA-Factory/models/glm4v-cubing
-model_name_or_path: /home/mjx/LLaMA-Factory/saves/glm4v_cubing_activitynet_test
+model_name_or_path: /home/mjx/LLaMA-Factory/models/glm4v-cubing
+# model_name_or_path: /home/mjx/LLaMA-Factory/saves/glm4v_cubing_activitynet_test
 
 ### method
 stage: sft

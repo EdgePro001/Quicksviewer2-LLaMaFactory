@@ -33,7 +33,7 @@ class Glm4vProcessor(ProcessorMixin):
         video_processor ([`Glm4vVideoProcessor`], *optional*):
             The video processor for handling video inputs.
         config ([`Glm4vConfig`], *optional*):
-            The model config for accessing Cubing parameters and FPS settings.
+            The model config for accessing Cubing parameters.
         auto_videos_bound (`bool`, *optional*, defaults to `True`):
             Whether to automatically construct videos_bound from video_grid_thw.
             Set to False if you want to manually provide videos_bound.
@@ -63,16 +63,6 @@ class Glm4vProcessor(ProcessorMixin):
         # 设置自定义属性
         self.config = config
         self.auto_videos_bound = auto_videos_bound
-        
-        # === 从 Config 读取 FPS 并设置到 VideoProcessor ===
-        if self.video_processor is not None and self.config is not None:
-            if hasattr(self.config, 'video_fps'):
-                self.video_processor.fps = self.config.video_fps
-                print(f"[Processor Init] Set video_processor.fps to {self.config.video_fps}")
-            else:
-                print(f"[Processor Init] Config does not have 'video_fps', using video_processor default")
-        elif self.video_processor is not None:
-            print(f"[Processor Init] No config provided, video_processor using default fps={self.video_processor.fps}")
         
         # 设置 _in_target_context_manager（ProcessorMixin 需要）
         self._in_target_context_manager = False

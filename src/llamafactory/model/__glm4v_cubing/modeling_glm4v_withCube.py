@@ -46,30 +46,17 @@ class Glm4vCubingVideoMetadata:
     
     def to_flattened(self) -> torch.Tensor:
         """转换成 temporal token 级别格式"""
-        # result = []
-        # for t, h, w in self.original_grid_thw:
-        #     num_temporal_tokens = t.item() // self.temporal_patch_size
-        #     repeated = torch.tensor(
-        #         [[self.temporal_patch_size, h.item(), w.item()]] * num_temporal_tokens,
-        #         device=self.original_grid_thw.device,
-        #         dtype=self.original_grid_thw.dtype
-        #     )
-        #     result.append(repeated)
-        
-        # return torch.cat(result, dim=0)
-
         result = []
-        print(f"[DEBUG flatten] original_grid_thw: {self.original_grid_thw}")
         for t, h, w in self.original_grid_thw:
+            num_temporal_tokens = t.item() // self.temporal_patch_size
             repeated = torch.tensor(
-                [[1, h.item(), w.item()]] * t.item(),  # ← 注意这里是 1 和 t.item()
+                [[self.temporal_patch_size, h.item(), w.item()]] * num_temporal_tokens,
                 device=self.original_grid_thw.device,
                 dtype=self.original_grid_thw.dtype
             )
             result.append(repeated)
-    
+        
         return torch.cat(result, dim=0)
-
 @use_kernel_forward_from_hub("RMSNorm")
 class Glm4vRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -893,7 +880,7 @@ class Glm4vVisionModel(Glm4vPreTrainedModel):
 
         temporal_patch_size = self.config.temporal_patch_size
         # if temporal_patch_size > 1:
-        # 将 [[20, 24, 24]] 转换为 [[2, 24, 24]] × 10
+        # # 将 [[20, 24, 24]] 转换为 [[2, 24, 24]] × 10
         #     flattened_grid_thw = []
         #     for t, h, w in grid_thw:
         #         num_temporal_tokens = t.item() // temporal_patch_size
@@ -906,7 +893,6 @@ class Glm4vVisionModel(Glm4vPreTrainedModel):
         #     grid_thw_for_pos = torch.cat(flattened_grid_thw, dim=0)
         # else:
         #     grid_thw_for_pos = grid_thw
-
         grid_thw_for_pos = grid_thw
         print(f"[DEBUG Vision] grid_thw: {grid_thw}")
         print(f"[DEBUG Vision] hidden_states.shape[0]: {hidden_states.shape[0]}")
@@ -1953,7 +1939,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
         else:
             video_embeds = self._get_video_features_native(
                 pixel_values_videos,
-                video_metadata
+                video_metadata,
             )
         
         return video_embeds, video_metadata
@@ -2015,7 +2001,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 videos_bound.append((current_frame_idx, current_frame_idx + num_frames))
                 current_frame_idx += num_frames
 
-        print(f"[DEBUG cube feat] videos_bound (patch): {videos_bound}")
+        print(f"[DEBUG cube feat] videos_bound (original frames): {videos_bound}")
         
         # ========== 原有逻辑 ========== 
         flattened_grid_thw = video_metadata.to_flattened()
@@ -2234,6 +2220,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Glm4vModelOutputWithPast]:
         self._debug_tokenizer = tokenizer
+        # print(f"tokenizer is none: {tokenizer is None}")
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -2284,6 +2271,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
         video_metadata = None
         actual_num_video_tokens = 0
 
+        # print(f"tokenizer is none: {tokenizer is None}")
         if pixel_values_videos is not None:
             # ✅ 传递 tokenizer
             video_embeds_tuple, video_metadata = self.get_video_features(
@@ -2607,7 +2595,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
 
         print(f"  final_position_ids shape: {final_position_ids.shape}, dtype: {final_position_ids.dtype}")
         torch.set_printoptions(threshold=10000)
-        print(f"  final_position_ids: {final_position_ids}")
+        # print(f"  final_position_ids: {final_position_ids}")
         # Position IDs are indices, usually don't cause NaN directly unless used incorrectly
 
         print(f"  final_attention_mask shape: {final_attention_mask.shape}, dtype: {final_attention_mask.dtype}")
@@ -2826,6 +2814,7 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
         """
         print(f"[DEBUG generation] videos_bound: {videos_bound}")
         print(f"[DEBUG generation] video_grid_thw: {video_grid_thw}")
+        print(f"[DEBUG generation] tokenizer is none: {tokenizer is None}")
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,

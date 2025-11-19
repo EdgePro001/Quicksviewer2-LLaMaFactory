@@ -1,0 +1,52 @@
+### model
+model_name_or_path: /home/mjx/LLaMA-Factory/models/glm4v-cubing
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: activitynet_llamafactory
+template: glm4v
+cutoff_len: 4096                    # ⚡ 降低长度加速
+max_samples: 1000
+overwrite_cache: true
+preprocessing_num_workers: 8
+
+### output
+output_dir: saves/glm4v_cubing_h100_1h
+logging_steps: 10
+save_steps: 50                      # ⚡ 1小时内保存3-4次即可
+save_total_limit: 2
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 1      # ⚡ H100可以用4
+gradient_accumulation_steps: 16
+learning_rate: 5.0e-5
+num_train_epochs: 3                 # ⚡ 3轮足够
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+bf16: true
+ddp_timeout: 180000000
+dataloader_num_workers: 8
+remove_unused_columns: false
+
+### eval
+val_size: 0.1
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 50
+do_eval: true
+
+### optimization
+gradient_checkpointing: true        # H100显存大，可以关闭加速
+optim: adamw_torch
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+### logging
+report_to: tensorboard
+logging_first_step: true

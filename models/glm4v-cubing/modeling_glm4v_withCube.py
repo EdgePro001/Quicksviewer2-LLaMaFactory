@@ -2069,6 +2069,6 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
         """设置输出embedding层"""
         self.lm_head = new_embeddings
 
-__all__ = ["Glm4vForConditionalGeneration", "Glm4vModel", "Glßm4vPreTrainedModel", "Glm4vTextModel", "Glm4vVisionModel"]
+__all__ = ["Glm4vForConditionalGeneration", "Glm4vModel", "Glm4vPreTrainedModel", "Glm4vTextModel", "Glm4vVisionModel"]
 AutoModel.register(Glm4vConfig, Glm4vModel, exist_ok=True)
 AutoModelForCausalLM.register(Glm4vConfig, Glm4vForConditionalGeneration, exist_ok=True)

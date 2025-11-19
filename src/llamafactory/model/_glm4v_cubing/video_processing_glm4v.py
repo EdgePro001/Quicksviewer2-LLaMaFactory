@@ -29,7 +29,6 @@ class Glm4vVideoProcessorInitKwargs(VideosKwargs, total=False):
     temporal_patch_size: int
     merge_size: int
     max_duration: int
-    fps: float  # ← 新增：允许从外部传入
 
 
 @add_start_docstrings(
@@ -42,8 +41,6 @@ class Glm4vVideoProcessorInitKwargs(VideosKwargs, total=False):
             The temporal patch size of the vision encoder.
         merge_size (`int`, *optional*, defaults to 2):
             The merge size of the vision encoder to llm encoder.
-        fps (`float`, *optional*, defaults to 2.0):
-            Target frames per second for video sampling. Can be overridden by config.video_fps.
     """,
 )
 class Glm4vVideoProcessor(BaseVideoProcessor):
@@ -63,25 +60,12 @@ class Glm4vVideoProcessor(BaseVideoProcessor):
     merge_size = 2
     valid_kwargs = Glm4vVideoProcessorInitKwargs
     num_frames = 16
-    
-    # === 移除硬编码的 fps，改为可配置 ===
-    # fps = 2  # ← 删除
+    fps = 2
 
     model_input_names = ["pixel_values_videos", "video_grid_thw"]
 
-    def __init__(self, fps: Optional[float] = None, **kwargs: Unpack[Glm4vVideoProcessorInitKwargs]):
-        """
-        Initialize GLM4V Video Processor
-        
-        Args:
-            fps: Optional target frames per second. If None, defaults to 2.0.
-                 This can be overridden by passing config to Glm4vProcessor.
-        """
+    def __init__(self, **kwargs: Unpack[Glm4vVideoProcessorInitKwargs]):
         super().__init__(**kwargs)
-        
-        # === 设置 FPS（优先级：参数 > 默认值）===
-        self.fps = fps if fps is not None else 2.0
-        
         if self.size is not None and (
             self.size.get("shortest_edge", None) is None or self.size.get("longest_edge", None) is None
         ):
@@ -108,14 +92,11 @@ class Glm4vVideoProcessor(BaseVideoProcessor):
         **kwargs,
     ):
         """
-        Sample video frames based on target FPS.
-        
         Args:
             metadata (`VideoMetadata`):
                 Metadata of the video containing information about total duration, fps and total number of frames.
             fps (`int` or `float`, *optional*):
-                Target frames to sample per second. If None, uses self.fps.
-        
+                Target frames to sample per second. Defaults to `self.fps`.
         Returns:
             np.ndarray:
                 Indices to sample video frames.
@@ -127,8 +108,6 @@ class Glm4vVideoProcessor(BaseVideoProcessor):
             )
 
         total_frames = metadata.total_num_frames
-        
-        # === 使用传入的 fps 或 self.fps ===
         requested_fps = fps if fps is not None else self.fps
 
         max_frame_idx = total_frames - 1
