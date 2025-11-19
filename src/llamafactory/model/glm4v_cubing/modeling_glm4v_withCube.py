@@ -1542,7 +1542,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
                         # 降级：递增
                         position_ids[0, i, j] = st_idx
                         position_ids[1, i, j] = 1.0
-                        position_ids[2, i. j] = 1.0
+                        position_ids[2, i, j] = 1.0
                         st_idx += 1
                 
                 # === 处理其他 tokens（文本、时间戳等）===
