@@ -1,57 +1,55 @@
 ### model
-model_name_or_path: /workspace/majunxian/VideoRL/Quicksviewer2-LLaMaFactory/models/glm4v-cubing
+model_name_or_path: /home/mjx/LLaMA-Factory/models/glm4v-cubing
 
 ### method
 stage: sft
 do_train: true
-finetuning_type: freeze
-freeze_trainable_modules: cubing,resampler
+finetuning_type: full  # 或者按你的freeze逻辑
 
 ### dataset
 dataset: msrvtt_caption_llamafactory
 template: glm4v
-cutoff_len: 4096                     
+cutoff_len: 4096
 max_samples: 90000
 overwrite_cache: true
 preprocessing_num_workers: 16
 
 ### output
-output_dir: /workspace/majunxian/VideoRL/Quicksviewer2-LLaMaFactory/checkpoints
+output_dir: saves/msrvtt_caption_8h100
 logging_steps: 10
-save_steps: 500                       # ⭐ 每500步保存
+save_steps: 500
 save_total_limit: 3
 plot_loss: true
 overwrite_output_dir: true
 
-### train - 核心超参数
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 2        
-learning_rate: 5.0e-5                 
-num_train_epochs: 1                   
-lr_scheduler_type: cosine             
-warmup_ratio: 0.03                    
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-5
+num_train_epochs: 1
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
 bf16: true
 ddp_timeout: 180000000
 dataloader_num_workers: 8
 remove_unused_columns: false
 
-### eval - 监控过拟合
-val_size: 0.05                        # ⭐ 5%验证集
-per_device_eval_batch_size: 2
+### eval
+val_size: 0.05
+per_device_eval_batch_size: 4
 eval_strategy: steps
-eval_steps: 500                       # ⭐ 每500步验证
+eval_steps: 500
 do_eval: true
-load_best_model_at_end: true          # ⭐ 自动保存最佳模型
+load_best_model_at_end: true
 metric_for_best_model: eval_loss
 
 ### optimization
-gradient_checkpointing: false         # H100显存够，关闭加速
+gradient_checkpointing: false
 optim: adamw_torch
-weight_decay: 0.01                    # ⭐ 权重衰减
-max_grad_norm: 1.0                    # ⭐ 梯度裁剪
+weight_decay: 0.01
+max_grad_norm: 1.0
 
 ### logging
-report_to: wandb
+report_to: wandb                      # ✅ 只保留这两个
 logging_first_step: true
-run_name: msrvtt_caption_8h100_lr5e5
-wandb_project: glm4v-cubing
+run_name: msrvtt_caption_8h100_lr5e5  # ✅ 实验名称
