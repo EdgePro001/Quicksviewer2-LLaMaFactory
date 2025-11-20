@@ -30,6 +30,7 @@ from .cubing_glm4v import Glm4vCubingModule
 from .resampler_glm4v import Glm4vResampler
 
 from transformers import AutoModel, AutoModelForCausalLM
+import numpy as np
 
 
 @dataclass
@@ -1377,22 +1378,6 @@ class Glm4vModel(Glm4vPreTrainedModel):
         
         mrope_position_deltas = []
         
-        # === 预计算每个 cube 应该占用的位置数量 ===
-        cube_position_counts = None
-        if video_metadata is not None and video_metadata.cube_bounds:
-            cube_position_counts = self._allocate_cube_position_counts(video_metadata)
-        
-        print(f"\n{'='*80}")
-        print(f"[DEBUG RoPE] Position Allocation Summary")
-        print(f"{'='*80}")
-        print(f"  Total sequence length: {seq_len}")
-        print(f"  Video metadata:")
-        print(f"    - Cube bounds: {video_metadata.cube_bounds[0]}")
-        print(f"    - Timestamps: {video_metadata.cube_timestamps[0]}")
-        print(f"    - Total video tokens: {video_metadata.actual_num_tokens}")
-        print(f"  Position allocation per cube: {cube_position_counts}")
-        print(f"{'='*80}\n")
-        
         # === 主循环 ===
         for i in range(batch_size):
             st_idx = 0
@@ -1401,9 +1386,16 @@ class Glm4vModel(Glm4vPreTrainedModel):
             in_video_section = False
             cube_start_pos = None
             
-            # ✅ 用于分段记录
             segment_records = []
             current_segment = None
+            
+            # ✅ 关键修复：为当前 batch item 计算位置分配
+            cube_position_counts = None
+            if video_metadata is not None and video_metadata.cube_bounds:
+                cube_position_counts = self._allocate_cube_position_counts(
+                    video_metadata,
+                    batch_idx=i  # ← 传递当前 batch 索引
+                )
             
             for j in range(seq_len):
                 # Padding 位置
@@ -1415,7 +1407,6 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 
                 # === 处理 <|video_start|> ===
                 if token == video_start_token_id:
-                    # 保存前面的文本段
                     if current_segment is not None:
                         if current_segment['type'] in ['text', 'timestamp']:
                             current_segment['token_end'] = j - 1
@@ -1428,7 +1419,6 @@ class Glm4vModel(Glm4vPreTrainedModel):
                     position_ids[2, i, j] = 1.0
                     st_idx += 1
                     
-                    # 记录 video_start
                     segment_records.append({
                         'type': 'video_start',
                         'token_idx': j,
@@ -1444,7 +1434,6 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 
                 # === 处理 <|video_end|> ===
                 elif token == video_end_token_id:
-                    # 保存最后一个段
                     if current_segment is not None:
                         if current_segment['type'] == 'video_cube':
                             current_segment['token_end'] = j - 1
@@ -1461,7 +1450,6 @@ class Glm4vModel(Glm4vPreTrainedModel):
                     position_ids[2, i, j] = 1.0
                     st_idx += 1
                     
-                    # 记录 video_end
                     segment_records.append({
                         'type': 'video_end',
                         'token_idx': j,
@@ -1472,48 +1460,36 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 
                 # === 处理 <|video|> tokens ===
                 elif token == video_token_id and in_video_section:
+                    # ✅ 关键修复：先检查是否需要切换 cube
+                    if cube_video_token_idx >= 64:  # num_tokens = 64
+                        # 保存当前 cube 段
+                        if current_segment is not None:
+                            current_segment['token_end'] = j - 1
+                            current_segment['pos_end'] = position_ids[0, i, j-1].item()
+                            segment_records.append(current_segment)
+                        
+                        # 切换到下一个 cube
+                        cube_idx += 1
+                        cube_video_token_idx = 0
+                        cube_start_pos = None
+                        current_segment = None
+                    
+                    # 检查新 cube 是否有效
                     if cube_position_counts is not None and cube_idx < len(cube_position_counts):
                         num_positions = cube_position_counts[cube_idx]
                         num_tokens = 64
                         
-                        # 检查是否需要切换到下一个 cube
-                        if cube_video_token_idx >= num_tokens:
-                            # 保存当前 cube 段
-                            if current_segment is not None:
-                                current_segment['token_end'] = j - 1
-                                current_segment['pos_end'] = position_ids[0, i, j-1].item()
-                                segment_records.append(current_segment)
-                            
-                            cube_idx += 1
-                            cube_video_token_idx = 0
-                            cube_start_pos = None
-                            current_segment = None
-                            
-                            if cube_idx < len(cube_position_counts):
-                                num_positions = cube_position_counts[cube_idx]
-                            else:
-                                position_ids[0, i, j] = st_idx
-                                position_ids[1, i, j] = 1.0
-                                position_ids[2, i, j] = 1.0
-                                st_idx += 1
-                                continue
-                        
-                        # === 记录 cube 起始位置 ===
+                        # 初始化新 cube
                         if cube_video_token_idx == 0:
-                            # ✅ 添加这段代码 ===
+                            # 保存前一个 segment（可能是 timestamp）
                             if current_segment is not None:
                                 if current_segment['type'] == 'timestamp':
                                     current_segment['token_end'] = j - 1
                                     current_segment['pos_end'] = st_idx - 1
-                                elif current_segment['type'] == 'video_cube':
-                                    current_segment['token_end'] = j - 1
-                                    current_segment['pos_end'] = position_ids[0, i, j-1].item()
                                 segment_records.append(current_segment)
-                            # ===========================
                             
                             cube_start_pos = st_idx
                             
-                            # 开始新的 cube 段
                             current_segment = {
                                 'type': 'video_cube',
                                 'cube_idx': cube_idx,
@@ -1525,8 +1501,12 @@ class Glm4vModel(Glm4vPreTrainedModel):
                                 'pos_start': cube_start_pos,
                             }
                         
-                        # === 在 cube 范围内 linspace ===
-                        relative_pos = cube_video_token_idx / (num_tokens - 1) if num_tokens > 1 else 0
+                        # 分配位置（linspace）
+                        if num_tokens > 1:
+                            relative_pos = cube_video_token_idx / (num_tokens - 1)
+                        else:
+                            relative_pos = 0
+                        
                         actual_pos = cube_start_pos + relative_pos * (num_positions - 1)
                         
                         position_ids[0, i, j] = actual_pos
@@ -1535,11 +1515,12 @@ class Glm4vModel(Glm4vPreTrainedModel):
                         
                         cube_video_token_idx += 1
                         
-                        # === cube 完成后，st_idx 跳过该 cube 占用的位置 ===
+                        # Cube 完成后更新 st_idx
                         if cube_video_token_idx >= num_tokens:
                             st_idx = cube_start_pos + num_positions
+                    
                     else:
-                        # 降级：递增
+                        # 超出范围，降级处理
                         position_ids[0, i, j] = st_idx
                         position_ids[1, i, j] = 1.0
                         position_ids[2, i, j] = 1.0
@@ -1547,18 +1528,15 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 
                 # === 处理其他 tokens（文本、时间戳等）===
                 else:
-                    # 检查是否是时间戳 token
-                    is_timestamp = in_video_section  # 简化判断：video section 中的非 video token
+                    is_timestamp = in_video_section
                     
                     if is_timestamp:
-                        # 保存前一个段（可能是 cube）
                         if current_segment is not None and current_segment['type'] == 'video_cube':
                             current_segment['token_end'] = j - 1
                             current_segment['pos_end'] = position_ids[0, i, j-1].item()
                             segment_records.append(current_segment)
                             current_segment = None
                         
-                        # 开始或继续时间戳段
                         if current_segment is None or current_segment['type'] != 'timestamp':
                             if current_segment is not None:
                                 if current_segment['type'] in ['text', 'timestamp']:
@@ -1613,8 +1591,110 @@ class Glm4vModel(Glm4vPreTrainedModel):
                     current_segment['token_end'] = j
                     current_segment['pos_end'] = position_ids[0, i, j].item()
                 segment_records.append(current_segment)
+
+            # ========================================
+            # ✅ 新增：验证 Cube 分配的一致性
+            # ========================================
+            print(f"\n{'='*80}")
+            print(f"[VALIDATION] Batch {i} - Cube Allocation Consistency Check")
+            print(f"{'='*80}")
             
-            # ✅ 打印分段调试信息
+            # 提取所有 video_cube 段
+            cube_segments = [seg for seg in segment_records if seg['type'] == 'video_cube']
+            
+            if len(cube_segments) > 0:
+                # 计算每个 cube 的帧数
+                cube_bounds = video_metadata.cube_bounds[i]
+                cube_frame_counts = []
+                for start_frame, end_frame in cube_bounds:
+                    cube_frame_counts.append(end_frame - start_frame)
+                
+                total_frames = sum(cube_frame_counts)
+                
+                # 计算每个 cube 的 token 数量
+                cube_token_counts = []
+                for seg in cube_segments:
+                    num_tokens = seg['token_end'] - seg['token_start'] + 1
+                    cube_token_counts.append(num_tokens)
+                
+                # 计算每个 cube 的位置范围
+                cube_position_ranges = []
+                for seg in cube_segments:
+                    pos_range = seg['pos_end'] - seg['pos_start']
+                    cube_position_ranges.append(pos_range)
+                
+                print(f"\n[Frame Distribution]")
+                print(f"  Cube frame counts: {cube_frame_counts}")
+                print(f"  Total frames: {total_frames}")
+                print(f"  Frame ratios: {[f'{count/total_frames:.4f}' for count in cube_frame_counts]}")
+                
+                print(f"\n[Token Distribution]")
+                print(f"  Cube token counts: {cube_token_counts}")
+                print(f"  Expected: all 64")
+                print(f"  ✓ All correct: {all(count == 64 for count in cube_token_counts)}")
+                
+                print(f"\n[Position Range Distribution]")
+                print(f"  Cube position ranges: {[f'{r:.4f}' for r in cube_position_ranges]}")
+                print(f"  Total position range: {sum(cube_position_ranges):.4f}")
+                print(f"  Position ratios: {[f'{r/sum(cube_position_ranges):.4f}' for r in cube_position_ranges]}")
+                
+                # ✅ 关键验证：帧数比例 vs 位置范围比例
+                print(f"\n[Ratio Consistency Check]")
+                print(f"  {'Cube':<6} {'Frames':<8} {'Frame%':<10} {'Pos Range':<12} {'Pos%':<10} {'Diff%':<10} {'Status':<10}")
+                print(f"  {'-'*70}")
+                
+                max_diff = 0.0
+                for idx, (frame_count, pos_range) in enumerate(zip(cube_frame_counts, cube_position_ranges)):
+                    frame_ratio = frame_count / total_frames
+                    pos_ratio = pos_range / sum(cube_position_ranges)
+                    diff = abs(frame_ratio - pos_ratio)
+                    max_diff = max(max_diff, diff)
+                    
+                    status = "✓ PASS" if diff < 0.01 else "✗ FAIL"
+                    
+                    print(f"  {idx:<6} {frame_count:<8} {frame_ratio:<10.4f} {pos_range:<12.4f} "
+                        f"{pos_ratio:<10.4f} {diff:<10.4f} {status:<10}")
+                
+                print(f"  {'-'*70}")
+                print(f"  Maximum difference: {max_diff:.6f}")
+                
+                if max_diff < 0.01:
+                    print(f"  ✅ VALIDATION PASSED: All cubes have consistent frame/position ratios")
+                else:
+                    print(f"  ⚠️  VALIDATION WARNING: Some cubes have inconsistent ratios (diff > 1%)")
+                
+                # 额外验证：每个 cube 内部的 linspace 是否均匀
+                print(f"\n[Internal Linspace Verification]")
+                for idx, seg in enumerate(cube_segments):
+                    token_start = seg['token_start']
+                    token_end = seg['token_end']
+                    num_tokens = token_end - token_start + 1
+                    
+                    if num_tokens > 1:
+                        # 提取该 cube 的所有位置
+                        cube_positions = position_ids[0, i, token_start:token_end+1].cpu().numpy()
+                        
+                        # 计算相邻位置的差值
+                        diffs = np.diff(cube_positions)
+                        mean_diff = np.mean(diffs)
+                        std_diff = np.std(diffs)
+                        
+                        print(f"  Cube {idx}: mean_step={mean_diff:.6f}, std={std_diff:.6f}")
+                        
+                        if std_diff < 1e-4:
+                            print(f"    ✓ Uniform spacing")
+                        else:
+                            print(f"    ⚠️  Non-uniform spacing detected")
+            
+            else:
+                print(f"  No video cubes found in this batch")
+            
+            print(f"{'='*80}\n")
+            # ========================================
+            # 结束验证逻辑
+            # ========================================
+
+
             print(f"\n{'='*80}")
             print(f"[DEBUG RoPE] Batch {i} - Detailed Position Assignments")
             print(f"{'='*80}")
@@ -1687,6 +1767,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
             print(f"  Max position used: {position_ids[0, i, :].max().item():.4f}")
             print(f"{'='*80}\n")
             
+            
             # 计算 delta
             max_pos = position_ids[:, i, :].max()
             delta = max_pos + 1 - seq_len
@@ -1700,7 +1781,6 @@ class Glm4vModel(Glm4vPreTrainedModel):
         ).unsqueeze(1)
         
         return position_ids, mrope_position_deltas
-
 
     def _safe_decode(self, token_ids):
         """安全解码 token IDs"""
@@ -1799,15 +1879,20 @@ class Glm4vModel(Glm4vPreTrainedModel):
     def _allocate_cube_position_counts(
         self,
         video_metadata: Glm4vCubingVideoMetadata,
+        batch_idx: int,  # ← 新增参数：当前 batch 的索引
     ) -> List[int]:
         """
-        计算每个 cube 应该占用多少个位置（按帧数比例）
+        计算指定 batch item 的每个 cube 应该占用多少个位置（按帧数比例）
+        
+        Args:
+            video_metadata: 视频元数据
+            batch_idx: 当前 batch 的索引（0, 1, 2, ...）
         
         Returns:
-            List of position counts
-            例如: [58, 77, 57]
+            List of position counts，例如: [58, 77, 57]
         """
-        cube_bounds = video_metadata.cube_bounds[0]
+        # ✅ 使用正确的 batch 索引
+        cube_bounds = video_metadata.cube_bounds[batch_idx]
         total_tokens = video_metadata.actual_num_tokens
         
         # 计算每个 cube 的帧数
@@ -1829,13 +1914,13 @@ class Glm4vModel(Glm4vPreTrainedModel):
         if diff != 0:
             position_counts[-1] += diff
         
-        print(f"\n[DEBUG AllocatePositionCounts]")
+        print(f"\n[DEBUG AllocatePositionCounts] Batch {batch_idx}:")
         print(f"  Total tokens: {total_tokens}")
         print(f"  Cube frames: {cube_frames}")
         print(f"  Position counts: {position_counts}")
         
         return position_counts
-    
+
     def _compute_cube_timestamps(
         self,
         cube_bounds: List[Tuple[int, int]],
@@ -2078,14 +2163,14 @@ class Glm4vModel(Glm4vPreTrainedModel):
             # === 计算时间戳 ===
             cube_timestamps = self._compute_cube_timestamps(
                 cube_bounds=cubing_result['cube_bounds'],
-                video_start_token=vs,
+                video_start_token=0,
                 temporal_patch_size=temporal_patch_size,
                 fps=effective_fps,
             )
             all_cube_timestamps.append(cube_timestamps)
             print(f"[DEBUG Timestamps] Video {video_idx} timestamps: {cube_timestamps}")
             
-            # === ✅ 新增：立即 tokenize 时间戳 ===
+            # === 立即 tokenize 时间戳 ===
             cube_timestamp_tokens = []
             for ts_text in cube_timestamps:
                 ts_token_ids = tokenizer.encode(ts_text, add_special_tokens=False)
@@ -2234,6 +2319,20 @@ class Glm4vModel(Glm4vPreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Glm4vModelOutputWithPast]:
         self._debug_tokenizer = tokenizer
+        import torch.distributed as dist
+        
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+        
+        actual_batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        
+        print(f"[RANK {rank}/{world_size}] Device: {device}, Batch size: {actual_batch_size}")
+    
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -2607,7 +2706,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
 
         print(f"  final_position_ids shape: {final_position_ids.shape}, dtype: {final_position_ids.dtype}")
         torch.set_printoptions(threshold=10000)
-        print(f"  final_position_ids: {final_position_ids}")
+        # print(f"  final_position_ids: {final_position_ids}")
         # Position IDs are indices, usually don't cause NaN directly unless used incorrectly
 
         print(f"  final_attention_mask shape: {final_attention_mask.shape}, dtype: {final_attention_mask.dtype}")

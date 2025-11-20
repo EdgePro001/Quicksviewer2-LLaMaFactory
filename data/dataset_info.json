@@ -746,5 +746,13 @@
       "messages": "messages",
       "videos": "videos"
     }
+  },
+  "msrvtt_caption_llamafactory": {
+    "file_name": "msrvtt_caption_llamafactory.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "videos": "videos"
+    }
   }
 }
