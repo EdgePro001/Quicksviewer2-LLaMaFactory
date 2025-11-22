@@ -44,6 +44,8 @@ class Glm4vCubingVideoMetadata:
     cube_timestamps: Optional[List[List[str]]] = None  # [["0000.0", "0007.0", ...]]
     cube_timestamp_tokens: Optional[List[List[List[int]]]] = None  # ← 新增：缓存 tokenized 结果
     temporal_patch_size: int = 2
+    use_thumbnail: bool = False  # 是否启用 thumbnail
+    thumbnail_num_queries: int = 64  # Thumbnail token 数量（默认 64）
     
     def to_flattened(self) -> torch.Tensor:
         """转换成 temporal token 级别格式"""
@@ -1359,7 +1361,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
         video_metadata: Glm4vCubingVideoMetadata,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Cubing 模式的 RoPE 位置编码（支持时间戳）"""
+        """Cubing 模式的 RoPE 位置编码（支持时间戳和 Thumbnail）"""
         
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
@@ -1388,6 +1390,11 @@ class Glm4vModel(Glm4vPreTrainedModel):
             
             segment_records = []
             current_segment = None
+            
+            # ✅ Thumbnail 相关状态
+            expecting_thumbnail = False
+            thumbnail_token_count = 0
+            thumbnail_start_pos = None
             
             # ✅ 关键修复：为当前 batch item 计算位置分配
             cube_position_counts = None
@@ -1430,6 +1437,64 @@ class Glm4vModel(Glm4vPreTrainedModel):
                     cube_video_token_idx = 0
                     cube_start_pos = None
                     current_segment = None
+                    
+                    # ✅ 新增：初始化 thumbnail 状态
+                    expecting_thumbnail = (
+                        video_metadata is not None and 
+                        video_metadata.use_thumbnail
+                    )
+                    thumbnail_token_count = 0
+                    thumbnail_start_pos = None
+                    
+                    continue
+                
+                # ✅ 新增：处理 Thumbnail
+                elif (expecting_thumbnail and 
+                      in_video_section and 
+                      token == video_token_id and
+                      thumbnail_token_count < video_metadata.thumbnail_num_queries):
+                    
+                    # 第一个 thumbnail token - 创建新 segment
+                    if thumbnail_token_count == 0:
+                        # 保存之前的 segment
+                        if current_segment is not None:
+                            if current_segment['type'] in ['text', 'timestamp']:
+                                current_segment['token_end'] = j - 1
+                                current_segment['pos_end'] = st_idx - 1
+                            segment_records.append(current_segment)
+                        
+                        thumbnail_start_pos = st_idx
+                        current_segment = {
+                            'type': 'thumbnail',
+                            'token_start': j,
+                            'pos_start': thumbnail_start_pos,
+                            'num_tokens': video_metadata.thumbnail_num_queries,
+                        }
+                    
+                    # 分配连续位置
+                    position_ids[0, i, j] = st_idx
+                    position_ids[1, i, j] = 1.0
+                    position_ids[2, i, j] = 1.0
+                    st_idx += 1
+                    thumbnail_token_count += 1
+                    
+                    # Thumbnail 完成
+                    if thumbnail_token_count >= video_metadata.thumbnail_num_queries:
+                        current_segment['token_end'] = j
+                        current_segment['pos_end'] = st_idx - 1
+                        segment_records.append(current_segment)
+                        current_segment = None
+                        expecting_thumbnail = False
+                        
+                        # 重置 cube 相关计数器（准备处理后续 cubes）
+                        # cube_idx = 0
+                        cube_video_token_idx = 0
+                        cube_start_pos = None
+                        
+                        print(f"[DEBUG RoPE Thumbnail] Completed thumbnail: "
+                              f"tokens [{thumbnail_start_pos}, {st_idx-1}], "
+                              f"positions [{thumbnail_start_pos}, {st_idx-1}]")
+                    
                     continue
                 
                 # === 处理 <|video_end|> ===
@@ -1458,8 +1523,8 @@ class Glm4vModel(Glm4vPreTrainedModel):
                     })
                     continue
                 
-                # === 处理 <|video|> tokens ===
-                elif token == video_token_id and in_video_section:
+                # === 处理 <|video|> tokens (Cubes) ===
+                elif token == video_token_id and in_video_section and not expecting_thumbnail:
                     # ✅ 关键修复：先检查是否需要切换 cube
                     if cube_video_token_idx >= 64:  # num_tokens = 64
                         # 保存当前 cube 段
@@ -1718,6 +1783,15 @@ class Glm4vModel(Glm4vPreTrainedModel):
                     print(f"  Position ID: {seg['position']}")
                     segment_num += 1
                 
+                # ✅ 新增：Thumbnail 打印
+                elif seg['type'] == 'thumbnail':
+                    print(f"\n[Segment {segment_num}] THUMBNAIL")
+                    print(f"  Token range: [{seg['token_start']}, {seg['token_end']}]")
+                    print(f"  Position range: [{seg['pos_start']:.0f}, {seg['pos_end']:.0f}]")
+                    print(f"  Num tokens: {seg['num_tokens']}")
+                    print(f"  Position span: {seg['pos_end'] - seg['pos_start']:.0f}")
+                    segment_num += 1
+                
                 elif seg['type'] == 'timestamp':
                     decoded = self._safe_decode(seg['token_ids'])
                     print(f"\n[Segment {segment_num}] TIMESTAMP")
@@ -1781,7 +1855,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
         ).unsqueeze(1)
         
         return position_ids, mrope_position_deltas
-
+    
     def _safe_decode(self, token_ids):
         """安全解码 token IDs"""
         try:
@@ -1891,31 +1965,37 @@ class Glm4vModel(Glm4vPreTrainedModel):
         Returns:
             List of position counts，例如: [58, 77, 57]
         """
-        # ✅ 使用正确的 batch 索引
         cube_bounds = video_metadata.cube_bounds[batch_idx]
         total_tokens = video_metadata.actual_num_tokens
-        
+
+        # 关键修复：扣除 thumbnail 占用的 tokens
+        if video_metadata.use_thumbnail:
+            cube_total_tokens = total_tokens - video_metadata.thumbnail_num_queries
+        else:
+            cube_total_tokens = total_tokens
+
         # 计算每个 cube 的帧数
         cube_frames = []
         for start_frame, end_frame in cube_bounds:
             num_frames = end_frame - start_frame
             cube_frames.append(num_frames)
-        
+
         total_frames = sum(cube_frames)
-        
-        # 按帧数比例分配位置
+
+        # 按帧数比例分配位置（使用 cube_total_tokens 而非 total_tokens）
         position_counts = []
         for num_frames in cube_frames:
-            allocated = int(round(total_tokens * num_frames / total_frames))
+            allocated = int(round(cube_total_tokens * num_frames / total_frames))
             position_counts.append(allocated)
         
         # 调整确保总和 = total_tokens
-        diff = total_tokens - sum(position_counts)
+        diff = cube_total_tokens - sum(position_counts)
         if diff != 0:
             position_counts[-1] += diff
         
         print(f"\n[DEBUG AllocatePositionCounts] Batch {batch_idx}:")
         print(f"  Total tokens: {total_tokens}")
+        print(f"  Cube total tokens: {cube_total_tokens}") 
         print(f"  Cube frames: {cube_frames}")
         print(f"  Position counts: {position_counts}")
         
@@ -2196,6 +2276,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
                         [0, h_patches],
                         [0, w_patches]
                     ],
+                    fps=effective_fps,
                 )
                 print(f"[DEBUG] resampled tokens: {tokens}")
                 cube_tokens.append(tokens)
@@ -2211,6 +2292,11 @@ class Glm4vModel(Glm4vPreTrainedModel):
         video_metadata.cube_bounds = all_cube_bounds
         video_metadata.cube_timestamps = all_cube_timestamps
         video_metadata.cube_timestamp_tokens = all_cube_timestamp_tokens  # ← 存储 tokenized 结果
+
+        video_metadata.use_thumbnail = self.config.cubing_use_thumbnail
+        video_metadata.thumbnail_num_queries = getattr(
+            self.config, 'thumbnail_num_queries', 64
+)
         
         if self.training and all_gate_logits:
             self._last_gate_logits = torch.cat(all_gate_logits, dim=0)
@@ -2452,24 +2538,45 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 
                 print(f"[DEBUG Step4] Timestamp token counts: {timestamp_token_counts}")
                 
+                # === ✅ 检查是否有 thumbnail
+                if video_metadata.use_thumbnail:
+                    has_thumbnail = True
+                    thumbnail_num_tokens = video_metadata.thumbnail_num_queries
+                    thumbnail_embeds = current_video_embeds[0:thumbnail_num_tokens]  # 前 64 个
+                    cube_offset = thumbnail_num_tokens  # 后续 cubes 从这里开始
+                else:
+                    has_thumbnail = False
+                    thumbnail_num_tokens = 0
+                    cube_offset = 0
+
+                # 计算每个 cube 的 token 数
+                num_cube_tokens = current_video_embeds.shape[0] - cube_offset
+                tokens_per_cube = num_cube_tokens // num_cubes
+
                 # === 构建 embeddings 序列 ===
                 parts = [
                     current_inputs_embeds[i, :video_pos],
                     video_start_embed,
                 ]
-                
+
+                # 插入 Thumbnail（如果存在）
+                if has_thumbnail:
+                    parts.append(thumbnail_embeds)
+                    print(f"[DEBUG Step4 Thumbnail] Added thumbnail: {thumbnail_embeds.shape}")
+
+                # 插入 Cubes
                 for cube_idx in range(num_cubes):
                     parts.append(timestamp_embeds_list[cube_idx])  # 时间戳
                     
-                    cube_start = cube_idx * tokens_per_cube
+                    cube_start = cube_offset + cube_idx * tokens_per_cube
                     cube_end = cube_start + tokens_per_cube
                     parts.append(current_video_embeds[cube_start:cube_end])  # 64 个 video tokens
-                
+
                 parts.extend([
                     video_end_embed,
                     current_inputs_embeds[i, video_pos + 1:]
                 ])
-                
+
                 new_embeds = torch.cat(parts, dim=0)
                 final_inputs_embeds_list.append(new_embeds)
                 
@@ -2481,16 +2588,19 @@ class Glm4vModel(Glm4vPreTrainedModel):
                         current_mask[:video_pos],
                         torch.ones(1, dtype=current_mask.dtype, device=device),  # video_start
                     ]
-                    
+
+                    # ✅ Thumbnail mask
+                    if has_thumbnail:
+                        mask_parts.append(
+                            torch.ones(thumbnail_num_tokens, dtype=current_mask.dtype, device=device)
+                        )
+
+                    # Cubes mask
                     for cube_idx in range(num_cubes):
                         num_ts_tokens = timestamp_token_counts[cube_idx]
-                        mask_parts.append(
-                            torch.ones(num_ts_tokens, dtype=current_mask.dtype, device=device)
-                        )
-                        mask_parts.append(
-                            torch.ones(tokens_per_cube, dtype=current_mask.dtype, device=device)
-                        )
-                    
+                        mask_parts.append(torch.ones(num_ts_tokens, dtype=current_mask.dtype, device=device))
+                        mask_parts.append(torch.ones(tokens_per_cube, dtype=current_mask.dtype, device=device))
+                        
                     mask_parts.extend([
                         torch.ones(1, dtype=current_mask.dtype, device=device),  # video_end
                         current_mask[video_pos + 1:]
@@ -2569,20 +2679,38 @@ class Glm4vModel(Glm4vPreTrainedModel):
                     cube_timestamp_tokens = video_metadata.cube_timestamp_tokens[i]  # ← 使用预计算的 tokens
                     num_cubes = len(cube_timestamps)
                     num_video_tokens_inserted = actual_num_video_tokens_per_video_recalc[i]
-                    tokens_per_cube = num_video_tokens_inserted // num_cubes
                     
+                    # Calc offsets
+                    if video_metadata.use_thumbnail:
+                        has_thumbnail = True
+                        thumbnail_num_tokens = video_metadata.thumbnail_num_queries
+                        cube_offset = thumbnail_num_tokens
+                    else:
+                        has_thumbnail = False
+                        thumbnail_num_tokens = 0
+                        cube_offset = 0
+
+                    num_cube_tokens = num_video_tokens_inserted - cube_offset
+                    tokens_per_cube = num_cube_tokens // num_cubes
+
                     # === 构建 temp_input_ids ===
                     parts = []
-                    
+
                     # 前面部分
                     parts.append(input_ids[i, :video_pos_orig])
-                    
+
                     # <|video_start|>
                     parts.append(torch.tensor([video_start_token_id], device=device))
-                    
-                    # 每个 cube: 时间戳 + video tokens
+
+                    # ✅ Thumbnail
+                    if has_thumbnail:
+                        parts.append(
+                            torch.full((thumbnail_num_tokens,), video_placeholder_id, device=device)
+                        )
+
+                    # Cubes: timestamp + video tokens
                     for cube_idx in range(num_cubes):
-                        # ✅ 使用预计算的 timestamp token IDs
+                        # Timestamp
                         ts_token_ids = cube_timestamp_tokens[cube_idx]
                         parts.append(torch.tensor(ts_token_ids, device=device))
                         
@@ -2591,14 +2719,14 @@ class Glm4vModel(Glm4vPreTrainedModel):
                         
                         # Video tokens
                         parts.append(torch.full((tokens_per_cube,), video_placeholder_id, device=device))
-                    
+
                     # <|video_end|>
                     parts.append(torch.tensor([video_end_token_id], device=device))
-                    
+
                     # 后面部分
                     orig_after_start = video_pos_orig + 1
                     parts.append(input_ids[i, orig_after_start:])
-                    
+
                     # 拼接
                     temp_seq = torch.cat(parts)
                     

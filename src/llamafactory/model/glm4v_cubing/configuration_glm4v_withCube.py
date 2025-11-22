@@ -325,7 +325,8 @@ class Glm4vConfig(PretrainedConfig):
         cubing_temperature=0.5,
         cubing_lr_gumbel_start=1.0,
         cubing_lr_gumbel_end=0.001,
-        cubing_use_thumbnail=False,
+        cubing_use_thumbnail=True,
+        thumbnail_num_queries=64,
 
         # Resampler
         resampler_num_queries=64,
@@ -366,6 +367,7 @@ class Glm4vConfig(PretrainedConfig):
         self.cubing_lr_gumbel_start = cubing_lr_gumbel_start
         self.cubing_lr_gumbel_end = cubing_lr_gumbel_end
         self.cubing_use_thumbnail = cubing_use_thumbnail
+        self.thumbnail_num_queries = thumbnail_num_queries
         
         # === Resampler ===
         self.resampler_num_queries = resampler_num_queries

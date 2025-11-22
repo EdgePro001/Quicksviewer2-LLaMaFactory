@@ -158,9 +158,17 @@ class Glm4vCubingModule(nn.Module):
         )
         
         # === Thumbnail projection (optional) ===
-        # Purpose: Project weighted average of keyframes to LLM dimension as global video representation
+        # Purpose: Compress and project keyframe features to LLM dimension as global video representation
+        # QuickSViewer uses AvgPool2d(kernel_size=(9,1)) for 576→64
+        # We use AdaptiveAvgPool1d for flexibility with different resolutions
         if self.use_thumbnail:
+            # Store num_queries for thumbnail (typically 64)
+            self.thumbnail_num_queries = getattr(config, 'thumbnail_num_queries', 64)
+            
             self.thumbnail_fn = nn.Sequential(
+                # Adaptive pooling: works for any number of input patches
+                nn.AdaptiveAvgPool1d(self.thumbnail_num_queries),
+                # Project to LLM dimension
                 nn.Linear(self.vision_dim, self.lm_dim)
             )
     
@@ -187,7 +195,8 @@ class Glm4vCubingModule(nn.Module):
             dict containing:
                 - cube_bounds: List[(start, end)] - List of cube boundaries
                 - gate_logits: [N_temporal_tokens-1, 2] - Gate network output (for auxiliary loss)
-                - thumbnail: [lm_dim] or None - Global video representation
+                - thumbnail: [thumbnail_num_queries, lm_dim] or None - Global video representation
+                             (typically 64 tokens, but configurable)
                 - z_hard: [N_temporal_tokens] - Keyframe mask (1 indicates keyframe)
         """
         N_temporal_tokens = video_features.shape[0]
@@ -197,17 +206,12 @@ class Glm4vCubingModule(nn.Module):
             'temporal_patch_size', 
             1 
         )
-        print(f"[DEBUG CUBE] video_shapes: {video_features.shape}")
-        # print(f"  dtype: {video_features.dtype}")
-        # print(f"  LLM output has NaN: {torch.isnan(video_features).any()}")
-        # print(f"  LLM output has Inf: {torch.isinf(video_features).any()}")
-        
+        print(f"[DEBUG CUBE] video_features.shape: {video_features.shape}")
         
         effective_fpq = fpq / temporal_patch_size    
-        # print(f"[DEBUG CUBE] effective_fpq: {effective_fpq}")
         
-        # ========== Step 1: Calculate momentum  ==========
-        print("[DEBUG CUBE] step 1")
+        # ========== Step 1: Calculate momentum ==========
+        print("[DEBUG CUBE] step 1: Calculate momentum")
         # Momentum : Δ_i = α(F_i - F_{i-1}) + (1-α)Δ_{i-1}
         # [N, 576, 1536] → [N-1, 576, 1536]
         vid_feats_momentum = [video_features[1] - video_features[0]]
@@ -218,30 +222,24 @@ class Glm4vCubingModule(nn.Module):
             vid_feats_momentum.append(delta)
 
         vid_feats = torch.stack(vid_feats_momentum, dim=0)  # [N-1, 576, 1536]
-        print(f"[DEBUG CUBE step1] video_shapes: {vid_feats.shape}")
-        # print(f"  dtype: {vid_feats.dtype}")
-        # print(f"  LLM output has NaN: {torch.isnan(vid_feats).any()}")
-        # print(f"  LLM output has Inf: {torch.isinf(vid_feats).any()}")
+        print(f"[DEBUG CUBE step1] vid_feats shape: {vid_feats.shape}")
 
         # ========== Step 2: Aggregate momentum features ==========
         # [N-1, 576, 1536] → [N-1, 576, 1536] → [N-1, 1536]
-        print("[DEBUG CUBE] step 2")
+        print("[DEBUG CUBE] step 2: Aggregate momentum features")
         vid_feats = self.agg_frame_fn(vid_feats)
         print(f"[DEBUG CUBE step2] vid_feats after agg_frame_fn: {vid_feats.shape}")
-        # print(f"  dtype: {vid_feats.dtype}")
-        # print(f"  LLM output has NaN: {torch.isnan(vid_feats).any()}")
-        # print(f"  LLM output has Inf: {torch.isinf(vid_feats).any()}")
-        vid_feats = vid_feats.mean(dim=1)
+        vid_feats = vid_feats.mean(dim=1)  # [N-1, 1536]
 
         
         # ========== Step 3: Gate network prediction ==========
         # Predict whether each position should be a keyframe based on momentum features
-        print("[DEBUG CUBE] step 3")
+        print("[DEBUG CUBE] step 3: Gate network prediction")
         gate_logits = self.gate_network(vid_feats)  # [N-1, 2]
         
         # ========== Step 4: Gumbel-Softmax sampling ==========
         # Calculate number of keyframes to select
-        print("[DEBUG CUBE] step 4")
+        print("[DEBUG CUBE] step 4: Gumbel-Softmax sampling")
         num_cubes = max(round(N_temporal_tokens / effective_fpq) - 1, 1)
         # Why -1? Because first frame will be forced as keyframe
         
@@ -257,29 +255,77 @@ class Glm4vCubingModule(nn.Module):
         
         # ========== Step 5: Force first frame as keyframe ==========
         # Ensure video beginning is always a cube start point
-        print("[DEBUG CUBE] step 5")
+        print("[DEBUG CUBE] step 5: Force first frame as keyframe")
         pad_z_hard = torch.ones(1, dtype=z_hard.dtype, device=device)
         z_hard = torch.cat([pad_z_hard, z_hard], dim=0)  # [N]
         
         # ========== Step 6: Identify cube boundaries ==========
-        print("[DEBUG CUBE] step 6")
+        print("[DEBUG CUBE] step 6: Identify cube boundaries")
         cube_bounds = find_segments(z_hard)
         
-        # ========== Step 7: Generate Thumbnail (optional) ==========
-        print("[DEBUG CUBE] step 7")
+        # ========== Step 7: Generate Thumbnail (QuickSViewer-style) ==========
+        print("[DEBUG CUBE] step 7: Generate Thumbnail")
         thumbnail = None
         if self.use_thumbnail:
-            # Use weighted average of keyframes as global video representation
-            weights = z_hard.float() / z_hard.sum()  # Normalized weights
-            thumbnail_feat = (vid_feats * weights.unsqueeze(-1)).sum(dim=0)  # [1536]
-            thumbnail = self.thumbnail_fn(thumbnail_feat)  # [lm_dim]
+            # Following QuickSViewer's approach:
+            # 1. Weighted average of keyframe features from original video_features
+            # 2. Compress N patches to thumbnail_num_queries tokens (typically 64)
+            # 3. Project to LLM dimension
+            
+            # Get number of patches from input
+            num_patches = video_features.shape[1]
+            print(f"[DEBUG CUBE step7] Input has {num_patches} patches per frame")
+            
+            # Use z_hard to weight the original video features
+            # Note: z_hard has shape [N], video_features has shape [N, num_patches, 1536]
+            weights = z_hard.float().unsqueeze(-1).unsqueeze(-1)  # [N, 1, 1]
+            weighted_feats = video_features * weights  # [N, num_patches, 1536]
+            
+            # Sum over frames and normalize
+            thumbnail_feat = weighted_feats.sum(dim=0, keepdim=True)  # [1, num_patches, 1536]
+            thumbnail_feat = thumbnail_feat / z_hard.sum()  # Normalize by number of keyframes
+            
+            print(f"[DEBUG CUBE step7] thumbnail_feat shape before pooling: {thumbnail_feat.shape}")
+            
+            # Transpose for AdaptiveAvgPool1d: [1, num_patches, 1536] → [1, 1536, num_patches]
+            thumbnail_feat = thumbnail_feat.permute(0, 2, 1)  # [1, 1536, num_patches]
+            
+            # Compress num_patches to thumbnail_num_queries tokens using adaptive pooling
+            # This works for any num_patches (576, 1024, 256, etc.)
+            # Input: [1, 1536, num_patches] → Output: [1, 1536, thumbnail_num_queries]
+            thumbnail_feat = F.adaptive_avg_pool1d(
+                thumbnail_feat, 
+                self.thumbnail_num_queries
+            )  # [1, 1536, thumbnail_num_queries]
+            
+            # Transpose back: [1, 1536, thumbnail_num_queries] → [1, thumbnail_num_queries, 1536]
+            thumbnail_feat = thumbnail_feat.permute(0, 2, 1)  # [1, thumbnail_num_queries, 1536]
+            
+            print(f"[DEBUG CUBE step7] thumbnail_feat shape after pooling: {thumbnail_feat.shape}")
+            
+            # Remove batch dimension and apply projection
+            thumbnail_feat = thumbnail_feat.squeeze(0)  # [thumbnail_num_queries, 1536]
+            
+            # Project to LLM dimension
+            thumbnail = self.thumbnail_fn[1](thumbnail_feat)  # [thumbnail_num_queries, 4096]
+            # Note: thumbnail_fn[0] is AdaptiveAvgPool1d which we already applied manually
+            #       thumbnail_fn[1] is the Linear layer
+            
+            print(f"[DEBUG CUBE step7] Final thumbnail shape: {thumbnail.shape}")
+            print(f"[DEBUG CUBE step7] Compression ratio: {num_patches} patches → {self.thumbnail_num_queries} tokens")
 
-        print(f"[DEBUG CUBE] cube_bounds: {cube_bounds}, gate_logits: {gate_logits}, thumbnail: {thumbnail}, z_hard: {z_hard}, z: {z}")
+        print(f"[DEBUG CUBE] Summary:")
+        print(f"  - cube_bounds: {cube_bounds}")
+        print(f"  - num_cubes: {len(cube_bounds)}")
+        print(f"  - thumbnail shape: {thumbnail.shape if thumbnail is not None else None}")
+        if thumbnail is not None:
+            print(f"  - thumbnail tokens: {thumbnail.shape[0]}")
+        print(f"  - z_hard sum (num keyframes): {z_hard.sum().item()}")
         
         return {
             'cube_bounds': cube_bounds,
             'gate_logits': gate_logits,
-            'thumbnail': thumbnail,
+            'thumbnail': thumbnail,  # [thumbnail_num_queries, 4096] if use_thumbnail else None
             'z_hard': z_hard,
         }
     

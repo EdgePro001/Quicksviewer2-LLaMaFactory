@@ -258,11 +258,9 @@ class Glm4vResampler(nn.Module):
         # === Step 3: 生成 3D 位置（加 FPS 缩放）===
         print("[DEBUG RESAMPLER] step 3: generate 3D positions with FPS scaling")
         
-        # T 维度位置
         t_positions = torch.arange(t_start, t_end, device=device, dtype=torch.float32)
         
         # === FPS 缩放（关键）===
-        t_positions = torch.arange(t_start, t_end, device=device, dtype=torch.float32)
         
         if fps is None:
             fps = self.effective_video_fps  # = config.effective_video_fps
