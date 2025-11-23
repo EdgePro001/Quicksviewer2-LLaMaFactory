@@ -20,9 +20,9 @@ from transformers import AutoProcessor
 
 class Glm4vProcessor(ProcessorMixin):
     r"""
-    Constructs a GLM4V processor which wraps a GLM4V image processor and a GLM4V tokenizer into a single processor.
+    Constructs a GLM4V processor which wraps a GLM4V image processor, video processor and a GLM4V tokenizer into a single processor.
 
-    [`Glm4vProcessor`] offers all the functionalities of [`Glm4vCubingImageProcessor`] and [`PreTrainedTokenizer`].
+    [`Glm4vProcessor`] offers all the functionalities of [`Glm4vCubingImageProcessor`], [`Glm4vVideoProcessor`] and [`PreTrainedTokenizer`].
     See the [`~Glm4vProcessor.__call__`] and [`~Glm4vProcessor.decode`] for more information.
 
     Args:
@@ -30,21 +30,25 @@ class Glm4vProcessor(ProcessorMixin):
             The image processor is a required input.
         tokenizer ([`PreTrainedTokenizer`]):
             The tokenizer is a required input.
+        video_processor ([`Glm4vVideoProcessor`], *optional*):
+            The video processor for handling video inputs.
         config ([`Glm4vConfig`], *optional*):
-            The model config for accessing Cubing parameters.
+            The model config for accessing Cubing parameters and FPS settings.
         auto_videos_bound (`bool`, *optional*, defaults to `True`):
             Whether to automatically construct videos_bound from video_grid_thw.
             Set to False if you want to manually provide videos_bound.
     """
 
-    attributes = ["image_processor", "tokenizer"]
+    attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "Glm4vCubingImageProcessor"
     tokenizer_class = "AutoTokenizer"
+    video_processor_class = "Glm4vVideoProcessor"
 
     def __init__(
         self, 
         image_processor, 
-        tokenizer, 
+        tokenizer,
+        video_processor=None,
         config: Optional[Glm4vConfig] = None,
         auto_videos_bound: bool = True,
         **kwargs
@@ -54,10 +58,21 @@ class Glm4vProcessor(ProcessorMixin):
         
         self.image_processor = image_processor
         self.tokenizer = tokenizer
+        self.video_processor = video_processor
         
         # 设置自定义属性
         self.config = config
         self.auto_videos_bound = auto_videos_bound
+        
+        # === 从 Config 读取 FPS 并设置到 VideoProcessor ===
+        if self.video_processor is not None and self.config is not None:
+            if hasattr(self.config, 'video_fps'):
+                self.video_processor.fps = self.config.video_fps
+                print(f"[Processor Init] Set video_processor.fps to {self.config.video_fps}")
+            else:
+                print(f"[Processor Init] Config does not have 'video_fps', using video_processor default")
+        elif self.video_processor is not None:
+            print(f"[Processor Init] No config provided, video_processor using default fps={self.video_processor.fps}")
         
         # 设置 _in_target_context_manager（ProcessorMixin 需要）
         self._in_target_context_manager = False
@@ -114,18 +129,26 @@ class Glm4vProcessor(ProcessorMixin):
         if images is not None:
             image_inputs = self.image_processor(images=images, return_tensors=return_tensors)
 
-        # ========== Step 2: Process videos (pixel-level processing unchanged) ==========
+        # ========== Step 2: Process videos using video_processor ==========
         video_inputs = {}
         videos_bound = None
         
         if videos is not None:
-            # Process video pixels (same as native GLM4V)
-            video_inputs = self.image_processor(images=videos, return_tensors=return_tensors)
-            if 'image_grid_thw' in video_inputs:
-                video_inputs['video_grid_thw'] = video_inputs.pop('image_grid_thw')
-    
-            if 'pixel_values' in video_inputs:
-                video_inputs['pixel_values_videos'] = video_inputs.pop('pixel_values')
+            # ✅ Use video_processor if available, otherwise fallback to image_processor
+            if self.video_processor is not None:
+                video_inputs = self.video_processor(
+                    videos=videos,
+                    return_tensors=return_tensors,
+                    **kwargs
+                )
+            else:
+                # Fallback: use image_processor (legacy behavior)
+                print("[WARNING] video_processor not available, using image_processor as fallback")
+                video_inputs = self.image_processor(images=videos, return_tensors=return_tensors)
+                if 'image_grid_thw' in video_inputs:
+                    video_inputs['video_grid_thw'] = video_inputs.pop('image_grid_thw')
+                if 'pixel_values' in video_inputs:
+                    video_inputs['pixel_values_videos'] = video_inputs.pop('pixel_values')
             
             # ✨ Calculate token counts based on mode
             if self.config is not None and self.config.use_cubing:
@@ -160,8 +183,6 @@ class Glm4vProcessor(ProcessorMixin):
             
             processed_text = []
             for t in text:
-                # This is a simplified placeholder - actual implementation 
-                # would need to handle the specific token format of GLM4V
                 t = self._insert_image_tokens(t, num_image_tokens, num_video_tokens)
                 processed_text.append(t)
             
@@ -336,22 +357,48 @@ class Glm4vProcessor(ProcessorMixin):
         Returns:
             Text with placeholders replaced
         """
-        # Get image token from tokenizer
+        # Get image_token_string
         if hasattr(self.tokenizer, 'image_token'):
-            image_token = self.tokenizer.image_token
+            image_token_string = self.tokenizer.image_token
         else:
-            # Fallback to GLM4V's default
-            image_token = "<image>"
+            image_token_string = "<image>"
+
+        # Get video_token_string
+        specific_video_token_string = None
+        expected_video_token_id = None
         
-        # Replace <video> with N image tokens
+        if self.config and hasattr(self.config, 'video_token_id') and self.config.video_token_id is not None:
+            expected_video_token_id = self.config.video_token_id
+            try:
+                converted_token = self.tokenizer.convert_ids_to_tokens(expected_video_token_id)
+                if isinstance(converted_token, list):
+                    converted_token = converted_token[0]
+                
+                if converted_token is not None and converted_token != self.tokenizer.unk_token:
+                    specific_video_token_string = converted_token
+                else:
+                    specific_video_token_string = "<video>"
+            except Exception as e:
+                print(f"[WARNING] Error converting video token ID {expected_video_token_id}: {e}")
+                specific_video_token_string = "<video>"
+        else:
+            specific_video_token_string = "<video>"
+
+        if specific_video_token_string is None:
+            raise ValueError("Fatal error: Could not determine video token string.")
+
+        # Replace <video> tag
         if '<video>' in text and num_video_tokens > 0:
-            video_placeholder = image_token * num_video_tokens
-            text = text.replace('<video>', video_placeholder)
-        
-        # Replace <image> with N image tokens (if needed)
-        # Note: In GLM4V, <image> might already be the token itself
-        # This part depends on the specific tokenizer implementation
-        
+            video_placeholder = specific_video_token_string * num_video_tokens
+            text = text.replace('<video>', video_placeholder, 1)
+
+        # Replace <image> tag
+        if '<image>' in text and num_image_tokens > 0:
+            if image_token_string is None:
+                raise ValueError("Could not determine the image token string for replacement.")
+            image_placeholder = image_token_string * num_image_tokens
+            text = text.replace('<image>', image_placeholder)
+
         return text
 
     def batch_decode(self, *args, **kwargs):
@@ -372,8 +419,8 @@ class Glm4vProcessor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
-        # videos_bound is optional, so it's included in the list
-        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names + ["videos_bound"]))
+        video_processor_input_names = self.video_processor.model_input_names if self.video_processor else []
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names + video_processor_input_names + ["videos_bound"]))
     
 __all__ = ["Glm4vProcessor"]
 AutoProcessor.register(Glm4vConfig, Glm4vProcessor, exist_ok=True)

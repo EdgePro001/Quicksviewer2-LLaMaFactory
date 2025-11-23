@@ -1,0 +1,11 @@
+{"current_steps": 1, "total_steps": 5344, "loss": 10.8576, "lr": 0.0, "epoch": 0.00018712574850299402, "percentage": 0.02, "elapsed_time": "0:03:35", "remaining_time": "13 days, 8:22:33"}
+{"current_steps": 10, "total_steps": 5344, "loss": 10.4264, "lr": 2.7950310559006214e-06, "epoch": 0.0018712574850299401, "percentage": 0.19, "elapsed_time": "0:33:52", "remaining_time": "12 days, 13:06:23"}
+{"current_steps": 20, "total_steps": 5344, "loss": 8.8864, "lr": 5.900621118012423e-06, "epoch": 0.0037425149700598802, "percentage": 0.37, "elapsed_time": "1:09:15", "remaining_time": "12 days, 19:16:34"}
+{"current_steps": 30, "total_steps": 5344, "loss": 6.7069, "lr": 9.006211180124225e-06, "epoch": 0.00561377245508982, "percentage": 0.56, "elapsed_time": "1:40:31", "remaining_time": "12 days, 8:47:10"}
+{"current_steps": 40, "total_steps": 5344, "loss": 5.4902, "lr": 1.2111801242236026e-05, "epoch": 0.0074850299401197605, "percentage": 0.75, "elapsed_time": "2:14:57", "remaining_time": "12 days, 10:15:30"}
+{"current_steps": 50, "total_steps": 5344, "loss": 4.5959, "lr": 1.5217391304347828e-05, "epoch": 0.0093562874251497, "percentage": 0.94, "elapsed_time": "2:48:11", "remaining_time": "12 days, 8:47:17"}
+{"current_steps": 60, "total_steps": 5344, "loss": 4.2394, "lr": 1.8322981366459628e-05, "epoch": 0.01122754491017964, "percentage": 1.12, "elapsed_time": "3:24:08", "remaining_time": "12 days, 11:37:36"}
+{"current_steps": 70, "total_steps": 5344, "loss": 3.829, "lr": 2.1428571428571428e-05, "epoch": 0.01309880239520958, "percentage": 1.31, "elapsed_time": "3:57:26", "remaining_time": "12 days, 10:09:18"}
+{"current_steps": 80, "total_steps": 5344, "loss": 3.7949, "lr": 2.453416149068323e-05, "epoch": 0.014970059880239521, "percentage": 1.5, "elapsed_time": "4:30:04", "remaining_time": "12 days, 8:10:39"}
+{"current_steps": 90, "total_steps": 5344, "loss": 3.7293, "lr": 2.7639751552795035e-05, "epoch": 0.016841317365269462, "percentage": 1.68, "elapsed_time": "5:03:45", "remaining_time": "12 days, 7:32:18"}
+{"current_steps": 100, "total_steps": 5344, "loss": 3.7392, "lr": 3.074534161490684e-05, "epoch": 0.0187125748502994, "percentage": 1.87, "elapsed_time": "5:39:23", "remaining_time": "12 days, 8:37:21"}

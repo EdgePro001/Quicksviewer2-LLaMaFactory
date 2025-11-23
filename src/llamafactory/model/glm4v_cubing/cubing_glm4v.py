@@ -307,6 +307,7 @@ class Glm4vCubingModule(nn.Module):
             thumbnail_feat = thumbnail_feat.squeeze(0)  # [thumbnail_num_queries, 1536]
             
             # Project to LLM dimension
+            thumbnail_feat = thumbnail_feat.to(self.thumbnail_fn[1].weight.dtype)
             thumbnail = self.thumbnail_fn[1](thumbnail_feat)  # [thumbnail_num_queries, 4096]
             # Note: thumbnail_fn[0] is AdaptiveAvgPool1d which we already applied manually
             #       thumbnail_fn[1] is the Linear layer

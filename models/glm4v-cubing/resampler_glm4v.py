@@ -2,318 +2,394 @@
 # resampler_glm4v.py
 
 """
-GLM4V 3D Resampler Module
-
-Based on Quicksviewer's 3D Resampler, adapted for GLM4V architecture.
-Compresses video cubes to fixed number of tokens while projecting to LLM dimension.
+GLM4V 3D Resampler Module with RoPE and FPS scaling
 """
 
 import torch
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
+from typing import Optional
 
 
-def get_3d_sincos_pos_embed(embed_dim, grid_size):
+class RotaryEmbedding(nn.Module):
+    """1D Rotary Position Embedding"""
+    def __init__(self, dim, max_position_embeddings=10000, base=10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        
+        # Precompute inverse frequencies (keep as float32 for stability)
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+    
+    def forward(self, seq_len, device=None, dtype=None):
+        """
+        Generate RoPE frequencies
+        
+        Args:
+            seq_len: Sequence length
+            device: Target device
+            dtype: Target dtype
+        
+        Returns:
+            freqs: [seq_len, dim]
+        """
+        if device is None:
+            device = self.inv_freq.device
+        if dtype is None:
+            dtype = torch.float32
+        
+        # Generate position indices
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        
+        # Compute outer product
+        freqs = torch.outer(t, self.inv_freq.to(device))  # [seq_len, dim//2]
+        
+        # Duplicate
+        freqs = torch.cat([freqs, freqs], dim=-1)  # [seq_len, dim]
+        
+        # Convert to target dtype
+        return freqs.to(dtype)
+
+
+def apply_rotary_pos_emb(x, cos, sin):
     """
-    Generate 3D sinusoidal position embeddings
+    Apply rotary position embedding
     
     Args:
-        embed_dim: int - Embedding dimension
-        grid_size: tuple - (T, H, W) grid size
+        x: [*, seq_len, dim]
+        cos, sin: [seq_len, dim]
     
     Returns:
-        pos_embed: [T, H, W, embed_dim] - 3D position embeddings
+        x_rotated: [*, seq_len, dim]
     """
-    grid_t, grid_h, grid_w = grid_size
+    # Ensure cos/sin match input dtype
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
     
-    # Create coordinate grids
-    grid_t = torch.arange(grid_t, dtype=torch.float32)
-    grid_h = torch.arange(grid_h, dtype=torch.float32)
-    grid_w = torch.arange(grid_w, dtype=torch.float32)
+    # Split into even and odd
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
     
-    # Create 3D meshgrid with correct order (T, H, W)
-    grid = torch.meshgrid(grid_t, grid_h, grid_w, indexing='ij')
-    grid = torch.stack(grid, dim=0)  # [3, T, H, W]
+    cos_half = cos[..., 0::2]
+    sin_half = sin[..., 0::2]
     
-    pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, grid)
-    return pos_embed
+    # Rotation
+    x1_rot = x1 * cos_half - x2 * sin_half
+    x2_rot = x1 * sin_half + x2 * cos_half
+    
+    # Interleave
+    x_rot = torch.stack([x1_rot, x2_rot], dim=-1).flatten(-2)
+    
+    return x_rot
 
 
-def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
+def interpolate_rope_freqs(freqs, positions):
     """
-    Generate 3D position embeddings from grid
-    
-    Dimension allocation: temporal 2/8, height 3/8, width 3/8
+    Interpolate RoPE frequencies for floating point positions
     
     Args:
-        embed_dim: Embedding dimension (must be divisible by 8)
-        grid: [3, T, H, W] - Coordinate grid
+        freqs: [max_seq_len, dim]
+        positions: [N] - Floating point positions
     
     Returns:
-        emb: [T, H, W, embed_dim] - Position embeddings
+        interpolated_freqs: [N, dim]
     """
-    assert embed_dim % 8 == 0
+    device = freqs.device
+    dtype = freqs.dtype
     
-    # Temporal dimension: 2/8
-    emb_t = get_1d_sincos_pos_embed_from_grid(embed_dim // 8 * 2, grid[0])
-    # Height dimension: 3/8
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 8 * 3, grid[1])
-    # Width dimension: 3/8
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 8 * 3, grid[2])
+    # Ensure positions is float32 for computation
+    positions = positions.to(torch.float32)
     
-    emb = torch.cat([emb_t, emb_h, emb_w], dim=-1)  # [T, H, W, embed_dim]
-    return emb
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    Generate 1D sinusoidal position embeddings
+    # Floor and ceiling
+    pos_floor = positions.floor().long().clamp(0, freqs.shape[0] - 1)
+    pos_ceil = positions.ceil().long().clamp(0, freqs.shape[0] - 1)
     
-    Args:
-        embed_dim: Embedding dimension
-        pos: [T, H, W] - Position indices
+    # Weight
+    weight = (positions - pos_floor.float()).unsqueeze(-1)  # [N, 1]
     
-    Returns:
-        emb: [T, H, W, embed_dim] - Position embeddings
-    """
-    assert embed_dim % 2 == 0
+    # Interpolation
+    freqs_floor = freqs[pos_floor]  # [N, dim]
+    freqs_ceil = freqs[pos_ceil]
     
-    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000 ** omega  # [embed_dim // 2]
+    freqs_interp = freqs_floor * (1 - weight) + freqs_ceil * weight
     
-    # Outer product: position × omega
-    out = torch.einsum('thw,d->thwd', pos, omega)  # [T, H, W, embed_dim // 2]
-    
-    emb_sin = torch.sin(out)  # [T, H, W, embed_dim // 2]
-    emb_cos = torch.cos(out)  # [T, H, W, embed_dim // 2]
-    
-    emb = torch.cat([emb_sin, emb_cos], dim=-1)  # [T, H, W, embed_dim]
-    return emb
+    # Return in original dtype
+    return freqs_interp.to(dtype)
 
 
 class Glm4vResampler(nn.Module):
-    """
-    GLM4V 3D Resampler
-    
-    A 3D perceiver-resampler network that compresses video cubes to fixed number
-    of tokens while projecting from vision dimension to LLM dimension.
-    
-    Key features:
-        - Uses learnable queries for compression
-        - Applies 3D sinusoidal position embeddings
-        - Single cross-attention layer
-        - Projects from vision_dim (1536) to lm_dim (4096)
-    """
+    """GLM4V 3D Resampler with RoPE and FPS scaling"""
     
     def __init__(self, config):
-        """
-        Args:
-            config: Glm4vConfig object containing:
-                - vision_config.hidden_size: Vision feature dimension (1536)
-                - text_config.hidden_size: LLM feature dimension (4096)
-                - resampler_num_queries: Number of output tokens (64)
-                - resampler_num_heads: Number of attention heads (32)
-                - resampler_max_size: Max 3D size (300, 24, 24)
-        """
         super().__init__()
         
-        # Configuration parameters
-        self.vision_dim = config.vision_config.hidden_size  # 1536
-        self.lm_dim = config.text_config.hidden_size  # 4096
-        self.num_queries = config.resampler_num_queries  # 64
-        self.num_heads = config.resampler_num_heads  # 32
-        self.max_size = config.resampler_max_size  # (300, 24, 24)
+        # Configuration
+        self.vision_dim = config.vision_config.hidden_size
+        self.lm_dim = config.text_config.hidden_size
+        self.num_queries = config.resampler_num_queries
+        self.num_heads = config.resampler_num_heads
         
-        # Learnable queries in LLM dimension
+        # === FPS 配置（修正）===
+        self.reference_fps = getattr(config, 'reference_fps', 10.0)
+        
+        # ✅ 读取 effective_video_fps（而不是 default_video_fps）
+        self.effective_video_fps = getattr(config, 'effective_video_fps', 1.0)
+        
+        print(f"[Resampler Init] Reference FPS: {self.reference_fps}")
+        print(f"[Resampler Init] Default Effective Video FPS: {self.effective_video_fps}")
+        
+        # 维度分配 (2:3:3)
+        self.dim_ratio = (2, 3, 3)
+        total_ratio = sum(self.dim_ratio)
+        base_dim = self.lm_dim // total_ratio
+        
+        self.dim_t = base_dim * self.dim_ratio[0]
+        self.dim_h = base_dim * self.dim_ratio[1]
+        self.dim_w = base_dim * self.dim_ratio[2]
+        
+        leftover = self.lm_dim - (self.dim_t + self.dim_h + self.dim_w)
+        self.dim_w += leftover
+        
+        print(f"[Resampler Init] Dimension allocation - T:{self.dim_t}, H:{self.dim_h}, W:{self.dim_w}")
+        
+        # 3D RoPE
+        self.rope_t = RotaryEmbedding(self.dim_t)
+        self.rope_h = RotaryEmbedding(self.dim_h)
+        self.rope_w = RotaryEmbedding(self.dim_w)
+        
+        # Core components
         self.query = nn.Parameter(torch.zeros(self.num_queries, self.lm_dim))
-        
-        # KV projection: vision_dim → lm_dim
         self.kv_proj = nn.Linear(self.vision_dim, self.lm_dim, bias=False)
-        
-        # Cross-Attention
-        # Note: batch_first=False means (seq, batch, dim) format
-        self.attn = nn.MultiheadAttention(
-            self.lm_dim,
-            self.num_heads,
-            batch_first=False
-        )
-        
-        # Layer Normalizations
+        self.attn = nn.MultiheadAttention(self.lm_dim, self.num_heads, batch_first=False)
         self.ln_q = nn.LayerNorm(self.lm_dim, eps=1e-6)
         self.ln_kv = nn.LayerNorm(self.lm_dim, eps=1e-6)
         self.ln_post = nn.LayerNorm(self.lm_dim, eps=1e-6)
+        self.proj = nn.Parameter((self.lm_dim ** -0.5) * torch.randn(self.lm_dim, self.lm_dim))
         
-        # Output projection
-        self.proj = nn.Parameter(
-            (self.lm_dim ** -0.5) * torch.randn(self.lm_dim, self.lm_dim)
-        )
+        self.apply(self._init_weights)
         
-        # Initialize 3D position embeddings cache
-        self._set_3d_pos_cache(self.max_size)
-        
-        # Initialize weights
-        # self.apply(self._init_weights)
-    
-    def _set_3d_pos_cache(self, max_size, device='cpu'):
-        """
-        Initialize 3D position embeddings cache
-        
-        Args:
-            max_size: tuple - (max_T, max_H, max_W)
-            device: Device to create embeddings on
-        """
-        pos_embed = get_3d_sincos_pos_embed(self.lm_dim, max_size).to(device)
-        self.register_buffer("pos_embed", pos_embed, persistent=False)
-    
-    def _adjust_pos_cache(self, tgt_size_range, device):
-        """
-        Dynamically adjust position embeddings cache if needed
-        
-        Args:
-            tgt_size_range: list - [[t_start, t_end], [h_start, h_end], [w_start, w_end]]
-            device: Target device
-        """
-        max_t = tgt_size_range[0][1]
-        max_h = tgt_size_range[1][1]
-        max_w = tgt_size_range[2][1]
-        
-        if max_t > self.max_size[0] or max_h > self.max_size[1] or max_w > self.max_size[2]:
-            self.max_size = (
-                max(max_t, self.max_size[0]),
-                max(max_h, self.max_size[1]),
-                max(max_w, self.max_size[2])
-            )
-            self._set_3d_pos_cache(self.max_size, device)
-    
     def _init_weights(self, m):
         """Initialize weights"""
+        if hasattr(m, 'weight') and m.weight.device.type == 'meta':
+            return
+        
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.MultiheadAttention):
+            if hasattr(m, 'in_proj_weight') and m.in_proj_weight is not None:
+                if m.in_proj_weight.device.type != 'meta':
+                    nn.init.xavier_uniform_(m.in_proj_weight)
+            if hasattr(m, 'in_proj_bias') and m.in_proj_bias is not None:
+                if m.in_proj_bias.device.type != 'meta':
+                    nn.init.constant_(m.in_proj_bias, 0)
+    
+    def _post_init_parameters(self):
+        """Post-init for nn.Parameter"""
+        if self.query.device.type == 'meta':
+            return
+        
+        if torch.isnan(self.query).any() or self.query.std() < 1e-6:
+            trunc_normal_(self.query, std=0.02)
+        
+        if torch.isnan(self.proj).any() or self.proj.std() < 1e-6:
+            trunc_normal_(self.proj, std=0.02)
     
     def forward(
         self,
         cube_features: torch.Tensor,
         tgt_size_range: list,
+        fps: Optional[float] = None,  # ← 新增参数
     ):
         """
-        Compress cube features
+        Compress cube features with 3D RoPE and FPS scaling
         
         Args:
-            cube_features: [N_i * 576, 1536] - Flattened cube patches
-                - N_i: Number of frames in this cube
-                - 576: Patches per frame (24×24)
-                - 1536: Vision feature dimension
-            
-            tgt_size_range: list - 3D range specification
-                - For images: [[0, h], [0, w]]
-                - For cubes: [[t_start, t_end], [0, h], [0, w]]
+            cube_features: [N_patches, vision_dim] or [B, N_patches, vision_dim]
+            tgt_size_range: [[t_start, t_end], [h_start, h_end], [w_start, w_end]]
+                注意：t_start/t_end 是 temporal_patch_size 合并后的帧索引
+            fps: Optional[float] - 当前视频的有效 FPS（已考虑 temporal_patch_size）
+                 例如：原始 30 FPS，temporal_patch_size=2 → fps=15.0
+                 如果为 None，使用 effective_video_fps
         
         Returns:
-            output: [num_queries, lm_dim] - Compressed tokens
-                - If batch input, returns [B, num_queries, lm_dim]
+            output: [num_queries, lm_dim] or [B, num_queries, lm_dim]
         """
-        # ========== Step 1: Normalize tgt_size_range ==========
-        # Convert to 3D format
+        device = cube_features.device
+        dtype = cube_features.dtype
+        
+        print("[DEBUG RESAMPLER] step 1: normalize input")
+        
+        # Normalize tgt_size_range
         tgt_size_range = [
             [0, _] if isinstance(_, int) else _
             for _ in tgt_size_range
         ]
+        
         if len(tgt_size_range) == 2:
-            # Image: add temporal dimension
             tgt_size_range = [[0, 1], tgt_size_range[0], tgt_size_range[1]]
         
-        # ========== Step 2: Reshape input ==========
-        if cube_features.dim() == 3:
-            # [B, L, D]
-            pass
-        else:
-            # [L, D] → [1, L, D]
+        # Ensure batch dimension
+        if cube_features.dim() == 2:
             cube_features = cube_features.unsqueeze(0)
         
         B, L, D = cube_features.shape
-        device = cube_features.device
-        dtype = cube_features.dtype
+        print(f"[DEBUG RESAMPLER] cube_features: {cube_features.shape}, dtype: {dtype}")
         
-        # ========== Step 3: Calculate sizes ==========
-        tgt_sizes = torch.tensor(
-            [[r[1] - r[0] for r in tgt_size_range]],
-            device=device,
-            dtype=torch.int32
-        ).repeat(B, 1)  # [B, 3]
+        print("[DEBUG RESAMPLER] step 2: parse ranges")
         
-        patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1] * tgt_sizes[:, 2]
-        max_patch_len = torch.max(patch_len)
+        t_range, h_range, w_range = tgt_size_range
+        t_start, t_end = t_range
+        h_start, h_end = h_range
+        w_start, w_end = w_range
         
-        # ========== Step 4: KV projection ==========
-        x = self.kv_proj(cube_features)  # [B, L, lm_dim]
-        x = self.ln_kv(x).permute(1, 0, 2)  # [L, B, lm_dim]
+        num_t = t_end - t_start
+        num_h = h_end - h_start
+        num_w = w_end - w_start
         
-        # ========== Step 5: Position embeddings ==========
-        self._adjust_pos_cache(tgt_size_range, device)
+        print(f"[DEBUG RESAMPLER] T: {t_start}~{t_end}, H: {h_start}~{h_end}, W: {w_start}~{w_end}")
         
-        pos_embed_list = []
-        key_padding_mask = torch.zeros(
-            (B, max_patch_len), dtype=torch.bool, device=device
+        # === Step 3: 生成 3D 位置（加 FPS 缩放）===
+        print("[DEBUG RESAMPLER] step 3: generate 3D positions with FPS scaling")
+        
+        t_positions = torch.arange(t_start, t_end, device=device, dtype=torch.float32)
+        
+        # === FPS 缩放（关键）===
+        
+        if fps is None:
+            fps = self.effective_video_fps  # = config.effective_video_fps
+            print(f"[DEBUG RESAMPLER] Using default effective FPS: {fps}")
+        
+        if fps != self.reference_fps:
+            fps_scale = self.reference_fps / fps
+            t_positions_scaled = t_positions * fps_scale
+            print(f"[DEBUG RESAMPLER] FPS scaling: {fps:.2f} → {self.reference_fps:.2f}, scale={fps_scale:.3f}")
+        else:
+            t_positions_scaled = t_positions
+            print(f"[DEBUG RESAMPLER] No FPS scaling needed")
+        
+        # H/W 维度位置（不缩放）
+        h_positions = torch.arange(h_start, h_end, device=device, dtype=torch.float32)
+        w_positions = torch.arange(w_start, w_end, device=device, dtype=torch.float32)
+        
+        # 3D meshgrid
+        grid_t, grid_h, grid_w = torch.meshgrid(
+            t_positions_scaled, h_positions, w_positions, indexing='ij'
         )
         
-        for i in range(B):
-            t_range, h_range, w_range = tgt_size_range
-            
-            # Extract position embeddings for this sample
-            pos = self.pos_embed[
-                t_range[0]:t_range[1],  # Temporal
-                h_range[0]:h_range[1],  # Height
-                w_range[0]:w_range[1],  # Width
-                :
-            ]
-            pos = pos.reshape(-1, self.lm_dim).to(dtype)
-            pos_embed_list.append(pos)
-            
-            # Mark padding positions
-            key_padding_mask[i, patch_len[i]:] = True
+        # Flatten
+        flat_t = grid_t.flatten()
+        flat_h = grid_h.flatten()
+        flat_w = grid_w.flatten()
         
-        # Pad position embeddings
-        pos_embed = torch.nn.utils.rnn.pad_sequence(
-            pos_embed_list, batch_first=True, padding_value=0.0
-        ).permute(1, 0, 2)  # [L, B, lm_dim]
+        print("[DEBUG RESAMPLER] step 4: compute RoPE")
         
-        # ========== Step 6: Cross-Attention ==========
+        # Max values
+        max_t = int(flat_t.max().item()) + 1
+        max_h = int(flat_h.max().item()) + 1
+        max_w = int(flat_w.max().item()) + 1
+        
+        # Generate frequencies with target dtype
+        freqs_t = self.rope_t(max_t, device, dtype)
+        freqs_h = self.rope_h(max_h, device, dtype)
+        freqs_w = self.rope_w(max_w, device, dtype)
+        
+        # Index/Interpolate (支持浮点位置)
+        if flat_t.dtype == torch.float32 and (flat_t % 1.0).any():
+            # Floating point positions (FPS 缩放后可能产生)
+            freq_t = interpolate_rope_freqs(freqs_t, flat_t)
+            freq_h = interpolate_rope_freqs(freqs_h, flat_h)
+            freq_w = interpolate_rope_freqs(freqs_w, flat_w)
+            print("[DEBUG RESAMPLER] Using interpolated RoPE (floating point positions)")
+        else:
+            # Integer positions
+            freq_t = freqs_t[flat_t.long()]
+            freq_h = freqs_h[flat_h.long()]
+            freq_w = freqs_w[flat_w.long()]
+            print("[DEBUG RESAMPLER] Using indexed RoPE (integer positions)")
+        
+        # Concatenate
+        freqs = torch.cat([freq_t, freq_h, freq_w], dim=-1)  # [N_patches, lm_dim]
+        cos = freqs.cos()
+        sin = freqs.sin()
+        
+        print(f"[DEBUG RESAMPLER] RoPE freqs dtype: {freqs.dtype}")
+        
+        print("[DEBUG RESAMPLER] step 5: KV projection")
+        
+        kv = self.kv_proj(cube_features)  # [B, L, lm_dim]
+        kv = self.ln_kv(kv)
+        kv = kv.permute(1, 0, 2)  # [L, B, lm_dim]
+        
+        print(f"[DEBUG RESAMPLER] KV dtype: {kv.dtype}")
+        
+        # Apply RoPE to KV
+        cos_expanded = cos.unsqueeze(1)  # [L, 1, lm_dim]
+        sin_expanded = sin.unsqueeze(1)
+        
+        kv_rot = apply_rotary_pos_emb(kv, cos_expanded, sin_expanded)
+        
+        print(f"[DEBUG RESAMPLER] KV_rot dtype: {kv_rot.dtype}")
+        
+        print("[DEBUG RESAMPLER] step 6: query preparation")
+        
         q = self.ln_q(self.query)  # [num_queries, lm_dim]
         q = q.unsqueeze(1).repeat(1, B, 1)  # [num_queries, B, lm_dim]
         
-        out = self.attn(
-            q,  # [num_queries, B, lm_dim]
-            x + pos_embed,  # [L, B, lm_dim] - KV with positional info
-            x,  # [L, B, lm_dim] - Values without position
-            key_padding_mask=key_padding_mask
-        )[0]  # [num_queries, B, lm_dim]
+        print(f"[DEBUG RESAMPLER] Q dtype: {q.dtype}")
         
-        # ========== Step 7: Output projection ==========
-        x = out.permute(1, 0, 2)  # [B, num_queries, lm_dim]
-        x = self.ln_post(x)
-        x = x @ self.proj  # [B, num_queries, lm_dim]
+        # Query RoPE (position = 0)
+        q_cos = torch.ones_like(q)
+        q_sin = torch.zeros_like(q)
+        q_rot = apply_rotary_pos_emb(q, q_cos, q_sin)
         
-        # If single sample, squeeze batch dimension
+        print(f"[DEBUG RESAMPLER] Q_rot dtype: {q_rot.dtype}")
+        
+        print("[DEBUG RESAMPLER] step 7: cross-attention")
+        
+        # Ensure all inputs have same dtype
+        q_rot = q_rot.to(dtype)
+        kv_rot = kv_rot.to(dtype)
+        kv = kv.to(dtype)
+        
+        out, _ = self.attn(
+            q_rot,
+            kv_rot,
+            kv,
+            key_padding_mask=None
+        )
+        
+        print("[DEBUG RESAMPLER] step 8: output projection")
+        
+        out = out.permute(1, 0, 2)  # [B, num_queries, lm_dim]
+        out = self.ln_post(out)
+        out = out @ self.proj
+        
         if B == 1:
-            x = x.squeeze(0)  # [num_queries, lm_dim]
+            out = out.squeeze(0)
         
-        return x
+        print(f"[DEBUG RESAMPLER] output shape: {out.shape}, dtype: {out.dtype}")
+        
+        return out
     
     @property
     def config(self):
-        """Return configuration dict (for save/load)"""
+        """Return configuration dict"""
         return {
             "vision_dim": self.vision_dim,
             "lm_dim": self.lm_dim,
             "num_queries": self.num_queries,
             "num_heads": self.num_heads,
-            "max_size": self.max_size,
+            "dim_ratio": self.dim_ratio,
+            "reference_fps": self.reference_fps,
+            "effective_video_fps": self.effective_video_fps,
         }
-    
+
+
 __all__ = ["Glm4vResampler"]

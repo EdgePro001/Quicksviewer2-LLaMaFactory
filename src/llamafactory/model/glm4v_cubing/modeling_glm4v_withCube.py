@@ -44,7 +44,7 @@ class Glm4vCubingVideoMetadata:
     cube_timestamps: Optional[List[List[str]]] = None  # [["0000.0", "0007.0", ...]]
     cube_timestamp_tokens: Optional[List[List[List[int]]]] = None  # ← 新增：缓存 tokenized 结果
     temporal_patch_size: int = 2
-    use_thumbnail: bool = False  # 是否启用 thumbnail
+    use_thumbnail: bool = True  # 是否启用 thumbnail
     thumbnail_num_queries: int = 64  # Thumbnail token 数量（默认 64）
     
     def to_flattened(self) -> torch.Tensor:
@@ -120,18 +120,153 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size)
         self.use_3d = True
 
+    # def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    #     print(f"[PERF PATCH EMBED] Input device: {hidden_states.device}")
+    #     print(f"[PERF PATCH EMBED] Input dtype: {hidden_states.dtype}")
+    #     print(f"[PERF PATCH EMBED] Input shape: {hidden_states.shape}")
+    #     print(f"[PERF PATCH EMBED] Conv3D weight device: {self.proj.weight.device}")
+    
+    #     target_dtype = self.proj.weight.dtype
+
+    #     if self.use_3d:
+    #         hidden_states = hidden_states.view(
+    #             -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
+    #         )
+    #         hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
+    #     else:
+    #         N, C, H, W = hidden_states.shape
+        
+    #         # [N, C, H, W] -> [N, C, H//patch_size, patch_size, W//patch_size, patch_size]
+    #         h_patches = H // self.patch_size
+    #         w_patches = W // self.patch_size
+            
+    #         hidden_states = hidden_states.reshape(
+    #             N, C,
+    #             h_patches, self.patch_size,
+    #             w_patches, self.patch_size
+    #         )
+    #         # [N, C, h_patches, patch_size, w_patches, patch_size]
+    #         # -> [N, C, h_patches, w_patches, patch_size, patch_size]
+    #         hidden_states = hidden_states.permute(0, 1, 2, 4, 3, 5)
+    #         # -> [N*h_patches*w_patches, C, patch_size, patch_size]
+    #         hidden_states = hidden_states.reshape(-1, C, self.patch_size, self.patch_size)
+            
+    #         hidden_states = self.proj(hidden_states.to(dtype=target_dtype))  # [N*h*w, embed_dim, 1, 1]
+    #         hidden_states = hidden_states.view(-1, self.embed_dim)  # [N*h*w, embed_dim]
+
+    #     return hidden_states
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        import time
+        import torch.distributed as dist
+        
+        # 只在 rank 0 打印
+        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        
+        if is_rank0:
+            print(f"\n{'='*80}")
+            print(f"[PERF PATCH EMBED] Starting Patch Embedding")
+            print(f"{'='*80}")
+            print(f"[PERF PATCH EMBED] Input shape: {hidden_states.shape}")
+            print(f"[PERF PATCH EMBED] Input device: {hidden_states.device}")
+            print(f"[PERF PATCH EMBED] Input dtype: {hidden_states.dtype}")
+            print(f"[PERF PATCH EMBED] Conv3D weight device: {self.proj.weight.device}")
+            print(f"[PERF PATCH EMBED] Conv3D weight dtype: {self.proj.weight.dtype}")
+            print(f"[PERF PATCH EMBED] use_3d: {self.use_3d}")
+        
+        t_total_start = time.time()
+        
         target_dtype = self.proj.weight.dtype
 
         if self.use_3d:
+            # ========== Step 1: Reshape to 5D ==========
+            if is_rank0:
+                print(f"\n[PERF PATCH EMBED] Step 1: Reshaping to 5D tensor")
+                print(f"[PERF PATCH EMBED]   Target shape: [-1, {self.in_channels}, {self.temporal_patch_size}, {self.patch_size}, {self.patch_size}]")
+            
+            t0 = time.time()
             hidden_states = hidden_states.view(
                 -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
             )
-            hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
-        else:
-            N, C, H, W = hidden_states.shape
+            t_reshape = time.time() - t0
+            
+            if is_rank0:
+                print(f"[PERF PATCH EMBED]   After reshape: {hidden_states.shape}")
+                print(f"[PERF PATCH EMBED]   ⏱️  Reshape time: {t_reshape:.6f}s ({t_reshape*1000:.2f}ms)")
+            
+            # ========== Step 2: Data type conversion ==========
+            if is_rank0:
+                print(f"\n[PERF PATCH EMBED] Step 2: Type conversion")
+                print(f"[PERF PATCH EMBED]   From: {hidden_states.dtype} → To: {target_dtype}")
+            
+            t0 = time.time()
+            if hidden_states.dtype != target_dtype:
+                hidden_states = hidden_states.to(dtype=target_dtype)
+                t_dtype = time.time() - t0
+                if is_rank0:
+                    print(f"[PERF PATCH EMBED]   ⏱️  Type conversion time: {t_dtype:.6f}s ({t_dtype*1000:.2f}ms)")
+            else:
+                if is_rank0:
+                    print(f"[PERF PATCH EMBED]   Already correct dtype, skipped")
+            
+            # ========== Step 3: Conv3D (关键操作) ==========
+            if is_rank0:
+                print(f"\n[PERF PATCH EMBED] Step 3: Conv3D projection")
+                print(f"[PERF PATCH EMBED]   Kernel size: {self.proj.kernel_size}")
+                print(f"[PERF PATCH EMBED]   Stride: {self.proj.stride}")
+                print(f"[PERF PATCH EMBED]   Input channels: {self.proj.in_channels}")
+                print(f"[PERF PATCH EMBED]   Output channels: {self.proj.out_channels}")
+                        
+                print(f"[PERF PATCH EMBED]   Input is_contiguous: {hidden_states.is_contiguous()}")
+                print(f"[PERF PATCH EMBED]   Input stride: {hidden_states.stride()}")
+            
+            # 确保GPU同步以获得准确计时
+            if hidden_states.is_cuda:
+                torch.cuda.synchronize()
+            
+            t0 = time.time()
+            conv_output = self.proj(hidden_states)
+            
+            if hidden_states.is_cuda:
+                torch.cuda.synchronize()
+            
+            t_conv = time.time() - t0
+            
+            if is_rank0:
+                print(f"[PERF PATCH EMBED]   Output shape: {conv_output.shape}")
+                print(f"[PERF PATCH EMBED]   ⏱️  Conv3D time: {t_conv:.6f}s ({t_conv*1000:.2f}ms)")
+                
+                # 计算Conv3D的理论计算量
+                batch_size = hidden_states.shape[0]
+                input_size = hidden_states.shape[2] * hidden_states.shape[3] * hidden_states.shape[4]
+                kernel_size = self.proj.kernel_size[0] * self.proj.kernel_size[1] * self.proj.kernel_size[2]
+                flops = batch_size * self.proj.out_channels * input_size * self.proj.in_channels * kernel_size
+                print(f"[PERF PATCH EMBED]   Estimated FLOPs: {flops/1e9:.2f} GFLOPs")
+                if t_conv > 0:
+                    print(f"[PERF PATCH EMBED]   Throughput: {flops/t_conv/1e9:.2f} GFLOPs/s")
+            
+            # ========== Step 4: Final reshape ==========
+            if is_rank0:
+                print(f"\n[PERF PATCH EMBED] Step 4: Final reshape")
+                print(f"[PERF PATCH EMBED]   Target shape: [-1, {self.embed_dim}]")
+            
+            t0 = time.time()
+            hidden_states = conv_output.view(-1, self.embed_dim)
+            t_final_view = time.time() - t0
+            
+            if is_rank0:
+                print(f"[PERF PATCH EMBED]   Final shape: {hidden_states.shape}")
+                print(f"[PERF PATCH EMBED]   ⏱️  Final view time: {t_final_view:.6f}s ({t_final_view*1000:.2f}ms)")
         
-            # [N, C, H, W] -> [N, C, H//patch_size, patch_size, W//patch_size, patch_size]
+        else:
+            # ========== 2D path (for images) ==========
+            if is_rank0:
+                print(f"\n[PERF PATCH EMBED] Using 2D path (images)")
+            
+            N, C, H, W = hidden_states.shape
+            
+            # Reshape for 2D convolution
+            t0 = time.time()
             h_patches = H // self.patch_size
             w_patches = W // self.patch_size
             
@@ -140,14 +275,40 @@ class Glm4vVisionPatchEmbed(nn.Module):
                 h_patches, self.patch_size,
                 w_patches, self.patch_size
             )
-            # [N, C, h_patches, patch_size, w_patches, patch_size]
-            # -> [N, C, h_patches, w_patches, patch_size, patch_size]
             hidden_states = hidden_states.permute(0, 1, 2, 4, 3, 5)
-            # -> [N*h_patches*w_patches, C, patch_size, patch_size]
             hidden_states = hidden_states.reshape(-1, C, self.patch_size, self.patch_size)
+            t_reshape = time.time() - t0
             
-            hidden_states = self.proj(hidden_states.to(dtype=target_dtype))  # [N*h*w, embed_dim, 1, 1]
-            hidden_states = hidden_states.view(-1, self.embed_dim)  # [N*h*w, embed_dim]
+            if is_rank0:
+                print(f"[PERF PATCH EMBED]   ⏱️  Reshape time: {t_reshape:.6f}s")
+            
+            # Conv2D
+            if hidden_states.is_cuda:
+                torch.cuda.synchronize()
+            
+            t0 = time.time()
+            hidden_states = self.proj(hidden_states.to(dtype=target_dtype))
+            
+            if hidden_states.is_cuda:
+                torch.cuda.synchronize()
+            
+            t_conv = time.time() - t0
+            
+            if is_rank0:
+                print(f"[PERF PATCH EMBED]   ⏱️  Conv2D time: {t_conv:.6f}s")
+            
+            hidden_states = hidden_states.view(-1, self.embed_dim)
+        
+        # ========== Summary ==========
+        t_total = time.time() - t_total_start
+        
+        if is_rank0:
+            print(f"\n{'='*80}")
+            print(f"[PERF PATCH EMBED] ⏱️  TOTAL PATCH EMBED TIME: {t_total:.6f}s ({t_total*1000:.2f}ms)")
+            print(f"[PERF PATCH EMBED] Output shape: {hidden_states.shape}")
+            print(f"[PERF PATCH EMBED] Output device: {hidden_states.device}")
+            print(f"[PERF PATCH EMBED] Output dtype: {hidden_states.dtype}")
+            print(f"{'='*80}\n")
 
         return hidden_states
             
@@ -851,6 +1012,8 @@ class Glm4vVisionModel(Glm4vPreTrainedModel):
         self.gradient_checkpointing = False
         self.post_init()
 
+        self._debug_step_count = 0 # debug
+
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
         for t, h, w in grid_thw:
@@ -880,6 +1043,75 @@ class Glm4vVisionModel(Glm4vPreTrainedModel):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb, pos_ids
 
+    # def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, return_before_merge: bool = False) -> torch.Tensor:
+    #     """
+    #     Args:
+    #         hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
+    #             The final hidden states of the model.
+    #         grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
+    #             The temporal, height and width of feature shape of each image in LLM.
+
+    #     Returns:
+    #         `torch.Tensor`: hidden_states.
+    #     """
+    #     hidden_states = self.patch_embed(hidden_states)
+    #     hidden_states = self.post_conv_layernorm(hidden_states)
+
+    #     temporal_patch_size = self.config.temporal_patch_size
+    #     # if temporal_patch_size > 1:
+    #     # 将 [[20, 24, 24]] 转换为 [[2, 24, 24]] × 10
+    #     #     flattened_grid_thw = []
+    #     #     for t, h, w in grid_thw:
+    #     #         num_temporal_tokens = t.item() // temporal_patch_size
+    #     #         repeated = torch.tensor(
+    #     #             [[1, h.item(), w.item()]] * num_temporal_tokens,
+    #     #             device=grid_thw.device,
+    #     #             dtype=grid_thw.dtype
+    #     #         )
+    #     #         flattened_grid_thw.append(repeated)
+    #     #     grid_thw_for_pos = torch.cat(flattened_grid_thw, dim=0)
+    #     # else:
+    #     #     grid_thw_for_pos = grid_thw
+
+    #     grid_thw_for_pos = grid_thw
+    #     print(f"[DEBUG Vision] grid_thw: {grid_thw}")
+    #     print(f"[DEBUG Vision] hidden_states.shape[0]: {hidden_states.shape[0]}")
+    #     print(f"[DEBUG Vision] expected tokens: {sum(t*h*w for t,h,w in grid_thw)}")
+
+    #     rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_thw_for_pos)
+    #     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+    #     position_embeddings = (emb.cos(), emb.sin())
+
+    #     cu_seqlens = torch.repeat_interleave(grid_thw_for_pos[:, 1] * grid_thw_for_pos[:, 2], grid_thw_for_pos[:, 0]).cumsum(
+    #         dim=0,
+    #         dtype=grid_thw_for_pos.dtype if torch.jit.is_tracing() else torch.int32,
+    #     )
+    #     cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+    #     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    #     hidden_states = self.embeddings(hidden_states, seqlens, grid_thw_for_pos, image_type_ids[:, 0], image_type_ids[:, 1])
+
+    #     for blk in self.blocks:
+    #         hidden_states = blk(
+    #             hidden_states,
+    #             cu_seqlens=cu_seqlens,
+    #             position_embeddings=position_embeddings,
+    #         )
+
+    #     hidden_states = self.post_layernorm(hidden_states)
+
+    #     if return_before_merge:
+    #         # Cubing Mode
+    #         return hidden_states
+
+    #     # Naive Mode
+    #     hidden_states = hidden_states.view(
+    #         -1, self.spatial_merge_size, self.spatial_merge_size, hidden_states.shape[-1]
+    #     )
+    #     hidden_states = hidden_states.permute(0, 3, 1, 2)
+    #     hidden_states = self.downsample(hidden_states).view(-1, self.config.out_hidden_size)
+    #     hidden_states = self.merger(hidden_states)
+    #     return hidden_states
+
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, return_before_merge: bool = False) -> torch.Tensor:
         """
         Args:
@@ -891,30 +1123,53 @@ class Glm4vVisionModel(Glm4vPreTrainedModel):
         Returns:
             `torch.Tensor`: hidden_states.
         """
+        # ===== 性能监控开始 =====
+        import time
+        import torch.distributed as dist
+        
+        # 只在rank 0打印
+        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        
+        if is_rank0:
+            self._debug_step_count += 1
+            print(f"\n{'='*80}")
+            print(f"[PERF DEBUG] Vision Forward - Step {self._debug_step_count}")
+            print(f"{'='*80}")
+            
+            # 检查是否使用Flash Attention
+            attn_impl = getattr(self.config, '_attn_implementation', 'NOT SET')
+            print(f"[ATTN CHECK] _attn_implementation: {attn_impl}")
+            
+            if len(self.blocks) > 0:
+                first_attn = self.blocks[0].attn
+                print(f"[ATTN CHECK] Attention class: {first_attn.__class__.__name__}")
+                print(f"[ATTN CHECK] Attention config: {getattr(first_attn.config, '_attn_implementation', 'NOT SET')}")
+            
+            print(f"[INPUT] hidden_states.shape: {hidden_states.shape}")
+            print(f"[INPUT] grid_thw: {grid_thw}")
+        
+        t_total = time.time()
+        # ===== 监控结束 =====
+        
+        # ===== Patch Embed =====
+        t0 = time.time()
         hidden_states = self.patch_embed(hidden_states)
         hidden_states = self.post_conv_layernorm(hidden_states)
+        t_patch_embed = time.time() - t0
+        
+        if is_rank0:
+            print(f"[PERF] Patch Embed: {t_patch_embed:.3f}s")
 
         temporal_patch_size = self.config.temporal_patch_size
-        # if temporal_patch_size > 1:
-        # 将 [[20, 24, 24]] 转换为 [[2, 24, 24]] × 10
-        #     flattened_grid_thw = []
-        #     for t, h, w in grid_thw:
-        #         num_temporal_tokens = t.item() // temporal_patch_size
-        #         repeated = torch.tensor(
-        #             [[1, h.item(), w.item()]] * num_temporal_tokens,
-        #             device=grid_thw.device,
-        #             dtype=grid_thw.dtype
-        #         )
-        #         flattened_grid_thw.append(repeated)
-        #     grid_thw_for_pos = torch.cat(flattened_grid_thw, dim=0)
-        # else:
-        #     grid_thw_for_pos = grid_thw
-
         grid_thw_for_pos = grid_thw
-        print(f"[DEBUG Vision] grid_thw: {grid_thw}")
-        print(f"[DEBUG Vision] hidden_states.shape[0]: {hidden_states.shape[0]}")
-        print(f"[DEBUG Vision] expected tokens: {sum(t*h*w for t,h,w in grid_thw)}")
+        
+        if is_rank0:
+            print(f"[DEBUG] grid_thw: {grid_thw}")
+            print(f"[DEBUG] hidden_states.shape after patch_embed: {hidden_states.shape}")
+            print(f"[DEBUG] expected tokens: {sum(t*h*w for t,h,w in grid_thw)}")
 
+        # ===== Position Embeddings =====
+        t0 = time.time()
         rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_thw_for_pos)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
@@ -926,18 +1181,40 @@ class Glm4vVisionModel(Glm4vPreTrainedModel):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         hidden_states = self.embeddings(hidden_states, seqlens, grid_thw_for_pos, image_type_ids[:, 0], image_type_ids[:, 1])
+        t_pos_emb = time.time() - t0
+        
+        if is_rank0:
+            print(f"[PERF] Position Embeddings: {t_pos_emb:.3f}s")
 
-        for blk in self.blocks:
+        # ===== Transformer Blocks (最关键！) =====
+        t0 = time.time()
+        for i, blk in enumerate(self.blocks):
+            t_blk = time.time()
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
             )
+            
+            # 只打印前3个block和最后1个block的耗时
+            if is_rank0 and (i < 3 or i == len(self.blocks) - 1):
+                print(f"[PERF]   Block {i}: {time.time() - t_blk:.3f}s")
+        
+        t_blocks = time.time() - t0
+        if is_rank0:
+            print(f"[PERF] All Blocks ({len(self.blocks)} blocks): {t_blocks:.3f}s")
+            print(f"[PERF]   Avg per block: {t_blocks/len(self.blocks):.3f}s")
 
+        # ===== Post Processing =====
+        t0 = time.time()
         hidden_states = self.post_layernorm(hidden_states)
 
         if return_before_merge:
-            # Cubing Mode
+            t_post = time.time() - t0
+            if is_rank0:
+                print(f"[PERF] Post LayerNorm: {t_post:.3f}s")
+                print(f"[PERF] ⏱️  TOTAL Vision Forward: {time.time() - t_total:.3f}s")
+                print(f"{'='*80}\n")
             return hidden_states
 
         # Naive Mode
@@ -947,7 +1224,15 @@ class Glm4vVisionModel(Glm4vPreTrainedModel):
         hidden_states = hidden_states.permute(0, 3, 1, 2)
         hidden_states = self.downsample(hidden_states).view(-1, self.config.out_hidden_size)
         hidden_states = self.merger(hidden_states)
+        
+        t_post = time.time() - t0
+        if is_rank0:
+            print(f"[PERF] Post Processing (merge): {t_post:.3f}s")
+            print(f"[PERF] ⏱️  TOTAL Vision Forward: {time.time() - t_total:.3f}s")
+            print(f"{'='*80}\n")
+        
         return hidden_states
+
 
 
 @auto_docstring
@@ -1966,14 +2251,10 @@ class Glm4vModel(Glm4vPreTrainedModel):
             List of position counts，例如: [58, 77, 57]
         """
         cube_bounds = video_metadata.cube_bounds[batch_idx]
-        total_tokens = video_metadata.actual_num_tokens
-
-        # 关键修复：扣除 thumbnail 占用的 tokens
-        if video_metadata.use_thumbnail:
-            cube_total_tokens = total_tokens - video_metadata.thumbnail_num_queries
-        else:
-            cube_total_tokens = total_tokens
-
+        num_cubes = len(cube_bounds)
+        tokens_per_cube = 64
+        cube_total_tokens = num_cubes * tokens_per_cube  # 这里不包括 thumbnail
+    
         # 计算每个 cube 的帧数
         cube_frames = []
         for start_frame, end_frame in cube_bounds:
@@ -1994,7 +2275,6 @@ class Glm4vModel(Glm4vPreTrainedModel):
             position_counts[-1] += diff
         
         print(f"\n[DEBUG AllocatePositionCounts] Batch {batch_idx}:")
-        print(f"  Total tokens: {total_tokens}")
         print(f"  Cube total tokens: {cube_total_tokens}") 
         print(f"  Cube frames: {cube_frames}")
         print(f"  Position counts: {position_counts}")
@@ -2282,8 +2562,9 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 cube_tokens.append(tokens)
             
             if cubing_result['thumbnail'] is not None:
-                cube_tokens.insert(0, cubing_result['thumbnail'].unsqueeze(0))
+                cube_tokens.insert(0, cubing_result['thumbnail'])
             
+            print(f"[DEBUG TRAIN] cube_tokens: {cube_tokens[0].shape}, {cube_tokens[1].shape}, {cube_tokens[2].shape}")
             video_tokens = torch.cat(cube_tokens, dim=0)
             video_embeds_list.append(video_tokens)
         

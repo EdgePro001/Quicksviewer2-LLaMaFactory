@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import LayerNorm
+from torch.nn.init import trunc_normal_
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -29,6 +30,7 @@ from .cubing_glm4v import Glm4vCubingModule
 from .resampler_glm4v import Glm4vResampler
 
 from transformers import AutoModel, AutoModelForCausalLM
+import numpy as np
 
 
 @dataclass
@@ -39,23 +41,37 @@ class Glm4vCubingVideoMetadata:
     
     # Cubing 
     cube_bounds: Optional[List[List[Tuple[int, int]]]] = None  # [[(0, 7), (7, 14), ...]]
+    cube_timestamps: Optional[List[List[str]]] = None  # [["0000.0", "0007.0", ...]]
+    cube_timestamp_tokens: Optional[List[List[List[int]]]] = None  # ← 新增：缓存 tokenized 结果
     temporal_patch_size: int = 2
+    use_thumbnail: bool = True  # 是否启用 thumbnail
+    thumbnail_num_queries: int = 64  # Thumbnail token 数量（默认 64）
     
     def to_flattened(self) -> torch.Tensor:
         """转换成 temporal token 级别格式"""
+        # result = []
+        # for t, h, w in self.original_grid_thw:
+        #     num_temporal_tokens = t.item() // self.temporal_patch_size
+        #     repeated = torch.tensor(
+        #         [[self.temporal_patch_size, h.item(), w.item()]] * num_temporal_tokens,
+        #         device=self.original_grid_thw.device,
+        #         dtype=self.original_grid_thw.dtype
+        #     )
+        #     result.append(repeated)
+        
+        # return torch.cat(result, dim=0)
+
         result = []
+        print(f"[DEBUG flatten] original_grid_thw: {self.original_grid_thw}")
         for t, h, w in self.original_grid_thw:
-            num_temporal_tokens = t.item() // self.temporal_patch_size
-            # 关键：每个 temporal token 的 T 维度
             repeated = torch.tensor(
-                [[self.temporal_patch_size, h.item(), w.item()]] * num_temporal_tokens,
+                [[1, h.item(), w.item()]] * t.item(),  # ← 注意这里是 1 和 t.item()
                 device=self.original_grid_thw.device,
                 dtype=self.original_grid_thw.dtype
             )
             result.append(repeated)
-        
+    
         return torch.cat(result, dim=0)
-
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Glm4vRMSNorm(nn.Module):
@@ -100,19 +116,9 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.in_channels = config.in_channels
         self.embed_dim = config.hidden_size
 
-        if self.temporal_patch_size == 1:
-            self.proj = nn.Conv2d(
-                self.in_channels,
-                self.embed_dim,
-                kernel_size=self.patch_size,
-                stride=self.patch_size
-            )
-            self.use_3d = False
-        
-        else:
-            kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
-            self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size)
-            self.use_3d = True
+        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
+        self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size)
+        self.use_3d = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
@@ -269,6 +275,18 @@ class Glm4vVisionEmbeddings(nn.Module):
             adapted_pos_embed_fp32 = interpolated_embed_fp32.squeeze(0).squeeze(-1).permute(1, 0)
             adapted_pos_embed = adapted_pos_embed_fp32.to(pos_embed_weight.dtype).to(embeddings.device)
 
+        if embeddings.shape[0] != adapted_pos_embed.shape[0]:
+            num_repeats = embeddings.shape[0] // adapted_pos_embed.shape[0]
+            
+            # 确保是整倍数，否则会出错
+            if embeddings.shape[0] % adapted_pos_embed.shape[0] != 0:
+                raise ValueError(
+                    f"Embeddings dimension ({embeddings.shape[0]}) is not a multiple of "
+                    f"position embeddings dimension ({adapted_pos_embed.shape[0]})"
+                )
+                
+            adapted_pos_embed = adapted_pos_embed.repeat(num_repeats, 1)
+
         # Add adapted position encoding to embeddings
         embeddings = embeddings + adapted_pos_embed
 
@@ -285,6 +303,21 @@ def rotate_half(x):
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.shape[0] != cos.shape[0]:
+        num_repeats = q.shape[0] // cos.shape[0]
+        
+        # 确保是整倍数
+        if q.shape[0] % cos.shape[0] != 0:
+            raise ValueError(
+                f"Query dimension ({q.shape[0]}) is not a multiple of "
+                f"Cos/Sin dimension ({cos.shape[0]})"
+            )
+        
+        # cos/sin 原始shape是 [10752, head_dim]
+        # 将它们复制以匹配 q 的 batch 维度
+        cos = cos.repeat(num_repeats, 1) # new shape [21504, head_dim]
+        sin = sin.repeat(num_repeats, 1) # new shape [21504, head_dim]
+
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
     q, k = q.float(), k.float()
@@ -392,8 +425,45 @@ class Glm4vVisionAttention(nn.Module):
         else:
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+
+            tensor_dim = query_states.shape[2]  # query_states, key_states, value_states 维度 2 应该都一样
+
+            # ✨ 重要：确保 lengths 是 Tensor 以便使用 .repeat()
+            if not isinstance(lengths, torch.Tensor):
+                lengths_tensor = torch.tensor(lengths, device=query_states.device) # 假设 lengths 是 list
+            else:
+                lengths_tensor = lengths
+
+            lengths_sum = torch.sum(lengths).item() # 注意：如果 lengths 已经是 python list, 直接 sum(lengths)
+            # print(f"[DEBUG Attention Split] Original tensor_dim: {tensor_dim}")
+            # print(f"[DEBUG Attention Split] Original lengths_tensor shape: {lengths_tensor.shape}")
+            # print(f"[DEBUG Attention Split] Original lengths_sum: {lengths_sum}")
+
+            if tensor_dim != lengths_sum:
+                num_repeats = tensor_dim // lengths_sum
+
+                # 确保是整倍数
+                if tensor_dim % lengths_sum != 0:
+                    print(f"[ERROR Attention Split] Tensor dim {tensor_dim} is NOT a multiple of lengths sum {lengths_sum}!")
+                    raise ValueError(
+                        f"Tensor dim ({tensor_dim}) is not a multiple of "
+                        f"lengths sum ({lengths_sum})"
+                    )
+                
+                # print(f"[DEBUG Attention Split] Repeating lengths_tensor {num_repeats} times.")
+
+                # 重复 'lengths' 张量以匹配合并后的输入
+                # ✨ 使用 tensor 进行 repeat
+                lengths_tensor = lengths_tensor.repeat(num_repeats)
+
+                # print(f"[DEBUG Attention Split] Repeated lengths_tensor shape: {lengths_tensor.shape}")
+                # print(f"[DEBUG Attention Split] Repeated lengths_sum: {torch.sum(lengths_tensor).item()}")
+
+            final_split_list = lengths_tensor.tolist()
+            # print(f"[DEBUG Attention Split] Final split list length: {len(final_split_list)}")
+            # print(f"[DEBUG Attention Split] Final split list sum: {sum(final_split_list)}")
             splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+                torch.split(tensor, final_split_list, dim=2) for tensor in (query_states, key_states, value_states)
             ]
 
             attn_outputs = [
@@ -825,20 +895,25 @@ class Glm4vVisionModel(Glm4vPreTrainedModel):
         hidden_states = self.post_conv_layernorm(hidden_states)
 
         temporal_patch_size = self.config.temporal_patch_size
-        if temporal_patch_size > 1:
+        # if temporal_patch_size > 1:
         # 将 [[20, 24, 24]] 转换为 [[2, 24, 24]] × 10
-            flattened_grid_thw = []
-            for t, h, w in grid_thw:
-                num_temporal_tokens = t.item() // temporal_patch_size
-                repeated = torch.tensor(
-                    [[1, h.item(), w.item()]] * num_temporal_tokens,
-                    device=grid_thw.device,
-                    dtype=grid_thw.dtype
-                )
-                flattened_grid_thw.append(repeated)
-            grid_thw_for_pos = torch.cat(flattened_grid_thw, dim=0)
-        else:
-            grid_thw_for_pos = grid_thw
+        #     flattened_grid_thw = []
+        #     for t, h, w in grid_thw:
+        #         num_temporal_tokens = t.item() // temporal_patch_size
+        #         repeated = torch.tensor(
+        #             [[1, h.item(), w.item()]] * num_temporal_tokens,
+        #             device=grid_thw.device,
+        #             dtype=grid_thw.dtype
+        #         )
+        #         flattened_grid_thw.append(repeated)
+        #     grid_thw_for_pos = torch.cat(flattened_grid_thw, dim=0)
+        # else:
+        #     grid_thw_for_pos = grid_thw
+
+        grid_thw_for_pos = grid_thw
+        print(f"[DEBUG Vision] grid_thw: {grid_thw}")
+        print(f"[DEBUG Vision] hidden_states.shape[0]: {hidden_states.shape[0]}")
+        print(f"[DEBUG Vision] expected tokens: {sum(t*h*w for t,h,w in grid_thw)}")
 
         rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_thw_for_pos)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
@@ -988,6 +1063,122 @@ class Glm4vModel(Glm4vPreTrainedModel):
         
         self.post_init()
 
+        if hasattr(self, "_init_weights"): # Check if the method exists
+            print("[INFO INIT WEIGHTS] Applying custom initialization to cubing_module...")
+            if hasattr(self, 'cubing_module'):
+                self.cubing_module.apply(self._init_weights)
+            else:
+                print("[WARNING INIT WEIGHTS] cubing_module not found for initialization.")
+
+            print("[INFO INIT WEIGHTS] Applying custom initialization to resampler...")
+            if hasattr(self, 'resampler'):
+                self.resampler.apply(self._init_weights)
+            else:
+                print("[WARNING INIT WEIGHTS] resampler not found for initialization.")
+        else:
+            print("[WARNING INIT WEIGHTS] _init_weights method not found in Glm4vPreTrainedModel. Skipping explicit initialization.")
+
+    
+    def initialize_cubing_modules_if_needed(self):
+        """智能初始化 Cubing 和 Resampler 模块"""
+        if not hasattr(self, 'cubing_module'):
+            return
+        
+        print("\n[CHECK] Verifying Cubing module initialization...")
+        
+        # ===== 检查所有关键参数 =====
+        needs_init = self._check_resampler_params()
+        
+        if not needs_init:
+            print("[INFO] All Cubing modules properly initialized\n")
+            return
+        
+        print("[INFO] Initializing/Fixing Cubing modules...\n")
+        
+        # ===== 强制重新初始化所有参数 =====
+        self._force_init_resampler()
+        self._force_init_cubing()
+        
+        print("[INFO] Initialization complete!\n")
+
+    def _check_resampler_params(self):
+        """检查 Resampler 的所有参数是否正确初始化"""
+        issues = []
+        
+        for name, param in self.resampler.named_parameters():
+            device = param.device.type
+            
+            if device == 'meta':
+                issues.append(f"{name}: on meta device")
+                continue
+            
+            has_nan = torch.isnan(param).any()
+            is_zero = (param.std() < 1e-6)
+            
+            if has_nan:
+                issues.append(f"{name}: contains NaN")
+            elif is_zero and 'bias' not in name and 'ln' not in name:
+                # bias 和 LayerNorm 参数可以是 0
+                issues.append(f"{name}: all zeros (std={param.std():.6f})")
+        
+        if issues:
+            print("[ISSUES FOUND]")
+            for issue in issues:
+                print(f"  ❌ {issue}")
+            return True
+        
+        return False
+
+    def _force_init_resampler(self):
+        """强制初始化 Resampler 的所有参数"""
+        print("[INIT] Resampler modules:")
+        
+        # 1. 初始化所有 nn.Module
+        for name, m in self.resampler.named_modules():
+            if isinstance(m, nn.Linear):
+                if m.weight.device.type != 'meta':
+                    trunc_normal_(m.weight, std=0.02)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                    print(f"  ✅ {name} (Linear)")
+            
+            elif isinstance(m, nn.LayerNorm):
+                if m.weight.device.type != 'meta':
+                    nn.init.constant_(m.weight, 1.0)
+                    nn.init.constant_(m.bias, 0)
+                    print(f"  ✅ {name} (LayerNorm)")
+            
+            elif isinstance(m, nn.MultiheadAttention):
+                if hasattr(m, 'in_proj_weight') and m.in_proj_weight.device.type != 'meta':
+                    nn.init.xavier_uniform_(m.in_proj_weight)
+                    print(f"  ✅ {name}.in_proj_weight")
+                
+                if hasattr(m, 'in_proj_bias') and m.in_proj_bias.device.type != 'meta':
+                    nn.init.constant_(m.in_proj_bias, 0)
+                    print(f"  ✅ {name}.in_proj_bias")
+        
+        # 2. 初始化 nn.Parameter
+        if self.resampler.query.device.type != 'meta':
+            trunc_normal_(self.resampler.query, std=0.02)
+            print(f"  ✅ query")
+        
+        if self.resampler.proj.device.type != 'meta':
+            trunc_normal_(self.resampler.proj, std=0.02)
+            print(f"  ✅ proj")
+
+    def _force_init_cubing(self):
+        """强制初始化 Cubing Module"""
+        print("[INIT] Cubing module:")
+        
+        for name, m in self.cubing_module.named_modules():
+            if isinstance(m, nn.Linear):
+                if m.weight.device.type != 'meta':
+                    trunc_normal_(m.weight, std=0.02)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                    print(f"  ✅ {name}")
+
+
     def set_gumbel_noise(self, lr_gumbel: float):
         """Set current Gumbel noise level (called during training)"""
         if hasattr(self, 'cubing_module'):
@@ -998,6 +1189,7 @@ class Glm4vModel(Glm4vPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.language_model.set_input_embeddings(value)
+
 
     def set_decoder(self, decoder):
         self.language_model = decoder
@@ -1016,7 +1208,13 @@ class Glm4vModel(Glm4vPreTrainedModel):
         """
         Calculate the 3D rope index
         """
-        
+        # import traceback
+        # print(f"\n[DEBUG] get_rope_index called:")
+        # print(f"  input_ids.shape: {input_ids.shape if input_ids is not None else None}")
+        # print(f"  video_metadata: {video_metadata}")
+        # print(f"\n[CALL STACK]:")
+        # traceback.print_stack(limit=20)
+
         # ========== Cubing 模式：使用简化位置编码 ==========
         if video_metadata is not None and video_metadata.mode == "cubing":
             return self._get_rope_index_for_cubing(
@@ -1157,263 +1355,748 @@ class Glm4vModel(Glm4vPreTrainedModel):
 
             return position_ids, mrope_position_deltas
 
-    # def _get_rope_index_for_cubing(
-    #     self,
-    #     input_ids: torch.LongTensor,
-    #     video_metadata: Glm4vCubingVideoMetadata,
-    #     attention_mask: Optional[torch.Tensor] = None,
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-
-    #     batch_size = input_ids.shape[0]
-    #     seq_len = input_ids.shape[1]
-    #     device = input_ids.device
-        
-    #     image_token_id = self.config.image_token_id
-    #     video_start_token_id = self.config.video_start_token_id
-    #     video_end_token_id = self.config.video_end_token_id
-        
-    #     position_ids = torch.ones(
-    #         3, batch_size, seq_len,
-    #         dtype=torch.long,
-    #         device=device
-    #     )
-        
-    #     mrope_position_deltas = []
-        
-    #     for i in range(batch_size):
-    #         if attention_mask is not None:
-    #             valid_tokens = input_ids[i][attention_mask[i] == 1]
-    #         else:
-    #             valid_tokens = input_ids[i]
-            
-    #         # Simplify：所有 token 都用顺序编号
-    #         st_idx = 0
-    #         for j in range(len(valid_tokens)):
-    #             # 所有 token（包括 video tokens）都用相同的顺序位置
-    #             position_ids[:, i, j] = st_idx
-    #             st_idx += 1
-            
-    #         # Calc. delta
-    #         max_pos = position_ids[:, i, :].max()
-    #         delta = max_pos + 1 - seq_len
-    #         mrope_position_deltas.append(delta)
-        
-    #     mrope_position_deltas = torch.tensor(
-    #         mrope_position_deltas,
-    #         device=device,
-    #         dtype=torch.long
-    #     ).unsqueeze(1)
-        
-    #     return position_ids, mrope_position_deltas
-
     def _get_rope_index_for_cubing(
         self,
         input_ids: torch.LongTensor,
         video_metadata: Glm4vCubingVideoMetadata,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Cubing mrope: prorated positions distribution
-    
-        - T 维度：按 cube 的帧数比例分配位置
-        - H, W 维度：与 T 维度保持一致，共同编码时间信息
+        """Cubing 模式的 RoPE 位置编码（支持时间戳和 Thumbnail）"""
         
-        Args:
-            input_ids: [batch_size, seq_len]
-            video_metadata: 包含 cube_bounds 等信息
-            attention_mask: [batch_size, seq_len]
-        
-        Returns:
-            position_ids: [3, batch_size, seq_len]
-            mrope_position_deltas: [batch_size, 1]
-        """
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
         device = input_ids.device
         
-        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
         video_start_token_id = self.config.video_start_token_id
         video_end_token_id = self.config.video_end_token_id
         
+        # 初始化 position_ids
         position_ids = torch.ones(
             3, batch_size, seq_len,
-            dtype=torch.long,
+            dtype=torch.float,
             device=device
         )
         
         mrope_position_deltas = []
         
+        # === 主循环 ===
         for i in range(batch_size):
-            if attention_mask is not None:
-                valid_tokens = input_ids[i][attention_mask[i] == 1]
-            else:
-                valid_tokens = input_ids[i]
+            st_idx = 0
+            cube_idx = 0
+            cube_video_token_idx = 0
+            in_video_section = False
+            cube_start_pos = None
             
-            cube_positions = None
+            segment_records = []
+            current_segment = None
+            
+            # ✅ Thumbnail 相关状态
+            expecting_thumbnail = False
+            thumbnail_token_count = 0
+            thumbnail_start_pos = None
+            
+            # ✅ 关键修复：为当前 batch item 计算位置分配
+            cube_position_counts = None
             if video_metadata is not None and video_metadata.cube_bounds:
-                cube_positions = self._allocate_cube_positions(video_metadata, device)
-
-            print(f"[CUBE DEBUG]cube_positions: {cube_positions}")
+                cube_position_counts = self._allocate_cube_position_counts(
+                    video_metadata,
+                    batch_idx=i  # ← 传递当前 batch 索引
+                )
             
-            # ===== traverse tokens and distribute positions =====
-            st_idx = 0  # 文本和特殊 token 的位置计数
-        video_token_idx = 0
-        in_video_section = False
-        
-        # 预先确定 video 开始的位置
-        video_start_pos = None
-        
-        for j in range(len(valid_tokens)):
-            token = valid_tokens[j]
-            
-            if token == video_start_token_id:
-                in_video_section = True
-                video_start_pos = st_idx  # 记录 video 开始位置
-                position_ids[:, i, j] = st_idx
-                st_idx += 1
-                continue
+            for j in range(seq_len):
+                # Padding 位置
+                if attention_mask is not None and attention_mask[i, j] == 0:
+                    position_ids[:, i, j] = 1
+                    continue
                 
-            elif token == video_end_token_id:
-                in_video_section = False
-                position_ids[:, i, j] = st_idx
-                st_idx += 1
-                continue
-            
-            # 处理 video tokens
-            if token == self.config.video_token_id and in_video_section:
-                if cube_positions is not None and video_token_idx < len(cube_positions):
-                    t_pos = cube_positions[video_token_idx]
+                token = input_ids[i, j].item()
+                
+                # === 处理 <|video_start|> ===
+                if token == video_start_token_id:
+                    if current_segment is not None:
+                        if current_segment['type'] in ['text', 'timestamp']:
+                            current_segment['token_end'] = j - 1
+                            current_segment['pos_end'] = st_idx - 1
+                        segment_records.append(current_segment)
                     
-                    actual_pos = video_start_pos + t_pos
-                    position_ids[0, i, j] = actual_pos
-                    position_ids[1, i, j] = actual_pos
-                    position_ids[2, i, j] = actual_pos
-                    
-                    video_token_idx += 1
-                    
-                    st_idx = max(st_idx, actual_pos + 1)
-                else:
-                    position_ids[:, i, j] = st_idx
+                    in_video_section = True
+                    position_ids[0, i, j] = st_idx
+                    position_ids[1, i, j] = 1.0
+                    position_ids[2, i, j] = 1.0
                     st_idx += 1
+                    
+                    segment_records.append({
+                        'type': 'video_start',
+                        'token_idx': j,
+                        'token_id': token,
+                        'position': st_idx - 1,
+                    })
+                    
+                    cube_idx = 0
+                    cube_video_token_idx = 0
+                    cube_start_pos = None
+                    current_segment = None
+                    
+                    # ✅ 新增：初始化 thumbnail 状态
+                    expecting_thumbnail = (
+                        video_metadata is not None and 
+                        video_metadata.use_thumbnail
+                    )
+                    thumbnail_token_count = 0
+                    thumbnail_start_pos = None
+                    
+                    continue
+                
+                # ✅ 新增：处理 Thumbnail
+                elif (expecting_thumbnail and 
+                      in_video_section and 
+                      token == video_token_id and
+                      thumbnail_token_count < video_metadata.thumbnail_num_queries):
+                    
+                    # 第一个 thumbnail token - 创建新 segment
+                    if thumbnail_token_count == 0:
+                        # 保存之前的 segment
+                        if current_segment is not None:
+                            if current_segment['type'] in ['text', 'timestamp']:
+                                current_segment['token_end'] = j - 1
+                                current_segment['pos_end'] = st_idx - 1
+                            segment_records.append(current_segment)
+                        
+                        thumbnail_start_pos = st_idx
+                        current_segment = {
+                            'type': 'thumbnail',
+                            'token_start': j,
+                            'pos_start': thumbnail_start_pos,
+                            'num_tokens': video_metadata.thumbnail_num_queries,
+                        }
+                    
+                    # 分配连续位置
+                    position_ids[0, i, j] = st_idx
+                    position_ids[1, i, j] = 1.0
+                    position_ids[2, i, j] = 1.0
+                    st_idx += 1
+                    thumbnail_token_count += 1
+                    
+                    # Thumbnail 完成
+                    if thumbnail_token_count >= video_metadata.thumbnail_num_queries:
+                        current_segment['token_end'] = j
+                        current_segment['pos_end'] = st_idx - 1
+                        segment_records.append(current_segment)
+                        current_segment = None
+                        expecting_thumbnail = False
+                        
+                        # 重置 cube 相关计数器（准备处理后续 cubes）
+                        # cube_idx = 0
+                        cube_video_token_idx = 0
+                        cube_start_pos = None
+                        
+                        print(f"[DEBUG RoPE Thumbnail] Completed thumbnail: "
+                              f"tokens [{thumbnail_start_pos}, {st_idx-1}], "
+                              f"positions [{thumbnail_start_pos}, {st_idx-1}]")
+                    
+                    continue
+                
+                # === 处理 <|video_end|> ===
+                elif token == video_end_token_id:
+                    if current_segment is not None:
+                        if current_segment['type'] == 'video_cube':
+                            current_segment['token_end'] = j - 1
+                            current_segment['pos_end'] = position_ids[0, i, j-1].item()
+                        elif current_segment['type'] in ['text', 'timestamp']:
+                            current_segment['token_end'] = j - 1
+                            current_segment['pos_end'] = st_idx - 1
+                        segment_records.append(current_segment)
+                        current_segment = None
+                    
+                    in_video_section = False
+                    position_ids[0, i, j] = st_idx
+                    position_ids[1, i, j] = 1.0
+                    position_ids[2, i, j] = 1.0
+                    st_idx += 1
+                    
+                    segment_records.append({
+                        'type': 'video_end',
+                        'token_idx': j,
+                        'token_id': token,
+                        'position': st_idx - 1,
+                    })
+                    continue
+                
+                # === 处理 <|video|> tokens (Cubes) ===
+                elif token == video_token_id and in_video_section and not expecting_thumbnail:
+                    # ✅ 关键修复：先检查是否需要切换 cube
+                    if cube_video_token_idx >= 64:  # num_tokens = 64
+                        # 保存当前 cube 段
+                        if current_segment is not None:
+                            current_segment['token_end'] = j - 1
+                            current_segment['pos_end'] = position_ids[0, i, j-1].item()
+                            segment_records.append(current_segment)
+                        
+                        # 切换到下一个 cube
+                        cube_idx += 1
+                        cube_video_token_idx = 0
+                        cube_start_pos = None
+                        current_segment = None
+                    
+                    # 检查新 cube 是否有效
+                    if cube_position_counts is not None and cube_idx < len(cube_position_counts):
+                        num_positions = cube_position_counts[cube_idx]
+                        num_tokens = 64
+                        
+                        # 初始化新 cube
+                        if cube_video_token_idx == 0:
+                            # 保存前一个 segment（可能是 timestamp）
+                            if current_segment is not None:
+                                if current_segment['type'] == 'timestamp':
+                                    current_segment['token_end'] = j - 1
+                                    current_segment['pos_end'] = st_idx - 1
+                                segment_records.append(current_segment)
+                            
+                            cube_start_pos = st_idx
+                            
+                            current_segment = {
+                                'type': 'video_cube',
+                                'cube_idx': cube_idx,
+                                'cube_bounds': video_metadata.cube_bounds[i][cube_idx],
+                                'timestamp': video_metadata.cube_timestamps[i][cube_idx],
+                                'allocated_positions': num_positions,
+                                'num_tokens': num_tokens,
+                                'token_start': j,
+                                'pos_start': cube_start_pos,
+                            }
+                        
+                        # 分配位置（linspace）
+                        if num_tokens > 1:
+                            relative_pos = cube_video_token_idx / (num_tokens - 1)
+                        else:
+                            relative_pos = 0
+                        
+                        actual_pos = cube_start_pos + relative_pos * (num_positions - 1)
+                        
+                        position_ids[0, i, j] = actual_pos
+                        position_ids[1, i, j] = 1.0
+                        position_ids[2, i, j] = 1.0
+                        
+                        cube_video_token_idx += 1
+                        
+                        # Cube 完成后更新 st_idx
+                        if cube_video_token_idx >= num_tokens:
+                            st_idx = cube_start_pos + num_positions
+                    
+                    else:
+                        # 超出范围，降级处理
+                        position_ids[0, i, j] = st_idx
+                        position_ids[1, i, j] = 1.0
+                        position_ids[2, i, j] = 1.0
+                        st_idx += 1
+                
+                # === 处理其他 tokens（文本、时间戳等）===
+                else:
+                    is_timestamp = in_video_section
+                    
+                    if is_timestamp:
+                        if current_segment is not None and current_segment['type'] == 'video_cube':
+                            current_segment['token_end'] = j - 1
+                            current_segment['pos_end'] = position_ids[0, i, j-1].item()
+                            segment_records.append(current_segment)
+                            current_segment = None
+                        
+                        if current_segment is None or current_segment['type'] != 'timestamp':
+                            if current_segment is not None:
+                                if current_segment['type'] in ['text', 'timestamp']:
+                                    current_segment['token_end'] = j - 1
+                                    current_segment['pos_end'] = st_idx - 1
+                                segment_records.append(current_segment)
+                            
+                            current_segment = {
+                                'type': 'timestamp',
+                                'token_start': j,
+                                'pos_start': st_idx,
+                                'token_ids': [],
+                                'positions': [],
+                            }
+                        
+                        position_ids[0, i, j] = st_idx
+                        position_ids[1, i, j] = 1.0
+                        position_ids[2, i, j] = 1.0
+                        current_segment['token_ids'].append(token)
+                        current_segment['positions'].append(st_idx)
+                        st_idx += 1
+                    else:
+                        # 文本 token
+                        if current_segment is None or current_segment['type'] != 'text':
+                            if current_segment is not None:
+                                if current_segment['type'] in ['text', 'timestamp']:
+                                    current_segment['token_end'] = j - 1
+                                    current_segment['pos_end'] = st_idx - 1
+                                segment_records.append(current_segment)
+                            
+                            current_segment = {
+                                'type': 'text',
+                                'token_start': j,
+                                'pos_start': st_idx,
+                                'token_ids': [],
+                                'positions': [],
+                            }
+                        
+                        position_ids[0, i, j] = st_idx
+                        position_ids[1, i, j] = 1.0
+                        position_ids[2, i, j] = 1.0
+                        current_segment['token_ids'].append(token)
+                        current_segment['positions'].append(st_idx)
+                        st_idx += 1
+            
+            # 保存最后一个段
+            if current_segment is not None:
+                if current_segment['type'] in ['text', 'timestamp']:
+                    current_segment['token_end'] = j
+                    current_segment['pos_end'] = st_idx - 1
+                elif current_segment['type'] == 'video_cube':
+                    current_segment['token_end'] = j
+                    current_segment['pos_end'] = position_ids[0, i, j].item()
+                segment_records.append(current_segment)
+
+            # ========================================
+            # ✅ 新增：验证 Cube 分配的一致性
+            # ========================================
+            print(f"\n{'='*80}")
+            print(f"[VALIDATION] Batch {i} - Cube Allocation Consistency Check")
+            print(f"{'='*80}")
+            
+            # 提取所有 video_cube 段
+            cube_segments = [seg for seg in segment_records if seg['type'] == 'video_cube']
+            
+            if len(cube_segments) > 0:
+                # 计算每个 cube 的帧数
+                cube_bounds = video_metadata.cube_bounds[i]
+                cube_frame_counts = []
+                for start_frame, end_frame in cube_bounds:
+                    cube_frame_counts.append(end_frame - start_frame)
+                
+                total_frames = sum(cube_frame_counts)
+                
+                # 计算每个 cube 的 token 数量
+                cube_token_counts = []
+                for seg in cube_segments:
+                    num_tokens = seg['token_end'] - seg['token_start'] + 1
+                    cube_token_counts.append(num_tokens)
+                
+                # 计算每个 cube 的位置范围
+                cube_position_ranges = []
+                for seg in cube_segments:
+                    pos_range = seg['pos_end'] - seg['pos_start']
+                    cube_position_ranges.append(pos_range)
+                
+                print(f"\n[Frame Distribution]")
+                print(f"  Cube frame counts: {cube_frame_counts}")
+                print(f"  Total frames: {total_frames}")
+                print(f"  Frame ratios: {[f'{count/total_frames:.4f}' for count in cube_frame_counts]}")
+                
+                print(f"\n[Token Distribution]")
+                print(f"  Cube token counts: {cube_token_counts}")
+                print(f"  Expected: all 64")
+                print(f"  ✓ All correct: {all(count == 64 for count in cube_token_counts)}")
+                
+                print(f"\n[Position Range Distribution]")
+                print(f"  Cube position ranges: {[f'{r:.4f}' for r in cube_position_ranges]}")
+                print(f"  Total position range: {sum(cube_position_ranges):.4f}")
+                print(f"  Position ratios: {[f'{r/sum(cube_position_ranges):.4f}' for r in cube_position_ranges]}")
+                
+                # ✅ 关键验证：帧数比例 vs 位置范围比例
+                print(f"\n[Ratio Consistency Check]")
+                print(f"  {'Cube':<6} {'Frames':<8} {'Frame%':<10} {'Pos Range':<12} {'Pos%':<10} {'Diff%':<10} {'Status':<10}")
+                print(f"  {'-'*70}")
+                
+                max_diff = 0.0
+                for idx, (frame_count, pos_range) in enumerate(zip(cube_frame_counts, cube_position_ranges)):
+                    frame_ratio = frame_count / total_frames
+                    pos_ratio = pos_range / sum(cube_position_ranges)
+                    diff = abs(frame_ratio - pos_ratio)
+                    max_diff = max(max_diff, diff)
+                    
+                    status = "✓ PASS" if diff < 0.01 else "✗ FAIL"
+                    
+                    print(f"  {idx:<6} {frame_count:<8} {frame_ratio:<10.4f} {pos_range:<12.4f} "
+                        f"{pos_ratio:<10.4f} {diff:<10.4f} {status:<10}")
+                
+                print(f"  {'-'*70}")
+                print(f"  Maximum difference: {max_diff:.6f}")
+                
+                if max_diff < 0.01:
+                    print(f"  ✅ VALIDATION PASSED: All cubes have consistent frame/position ratios")
+                else:
+                    print(f"  ⚠️  VALIDATION WARNING: Some cubes have inconsistent ratios (diff > 1%)")
+                
+                # 额外验证：每个 cube 内部的 linspace 是否均匀
+                print(f"\n[Internal Linspace Verification]")
+                for idx, seg in enumerate(cube_segments):
+                    token_start = seg['token_start']
+                    token_end = seg['token_end']
+                    num_tokens = token_end - token_start + 1
+                    
+                    if num_tokens > 1:
+                        # 提取该 cube 的所有位置
+                        cube_positions = position_ids[0, i, token_start:token_end+1].cpu().numpy()
+                        
+                        # 计算相邻位置的差值
+                        diffs = np.diff(cube_positions)
+                        mean_diff = np.mean(diffs)
+                        std_diff = np.std(diffs)
+                        
+                        print(f"  Cube {idx}: mean_step={mean_diff:.6f}, std={std_diff:.6f}")
+                        
+                        if std_diff < 1e-4:
+                            print(f"    ✓ Uniform spacing")
+                        else:
+                            print(f"    ⚠️  Non-uniform spacing detected")
+            
             else:
-                # 非 video token
-                position_ids[:, i, j] = st_idx
-                st_idx += 1
-            # ===== Calc. delta =====
+                print(f"  No video cubes found in this batch")
+            
+            print(f"{'='*80}\n")
+            # ========================================
+            # 结束验证逻辑
+            # ========================================
+
+
+            print(f"\n{'='*80}")
+            print(f"[DEBUG RoPE] Batch {i} - Detailed Position Assignments")
+            print(f"{'='*80}")
+
+            print(f"Tokens 3-6: {input_ids[0, 3:7]}")
+            print(f"Decoded: {self._safe_decode(input_ids[0, 3:7])}")
+            
+            segment_num = 0
+            for seg in segment_records:
+                if seg['type'] == 'text':
+                    decoded = self._safe_decode(seg['token_ids'])
+                    print(f"\n[Segment {segment_num}] TEXT")
+                    print(f"  Token range: [{seg.get('token_start', '?')}, {seg.get('token_end', '?')}]")
+                    print(f"  Position IDs: {seg['positions'][:5]}...{seg['positions'][-3:] if len(seg['positions']) > 5 else ''}")
+                    print(f"  Decoded: {decoded}")
+                    segment_num += 1
+                
+                elif seg['type'] == 'video_start':
+                    print(f"\n[Segment {segment_num}] <|video_start|>")
+                    print(f"  Token index: {seg['token_idx']}")
+                    print(f"  Position ID: {seg['position']}")
+                    segment_num += 1
+                
+                # ✅ 新增：Thumbnail 打印
+                elif seg['type'] == 'thumbnail':
+                    print(f"\n[Segment {segment_num}] THUMBNAIL")
+                    print(f"  Token range: [{seg['token_start']}, {seg['token_end']}]")
+                    print(f"  Position range: [{seg['pos_start']:.0f}, {seg['pos_end']:.0f}]")
+                    print(f"  Num tokens: {seg['num_tokens']}")
+                    print(f"  Position span: {seg['pos_end'] - seg['pos_start']:.0f}")
+                    segment_num += 1
+                
+                elif seg['type'] == 'timestamp':
+                    decoded = self._safe_decode(seg['token_ids'])
+                    print(f"\n[Segment {segment_num}] TIMESTAMP")
+                    print(f"  Token range: [{seg.get('token_start', '?')}, {seg.get('token_end', '?')}]")
+                    print(f"  Token count: {len(seg['token_ids'])} tokens")
+                    print(f"  Position IDs: {seg['positions']}")
+                    print(f"  Token IDs: {seg['token_ids']}")
+                    print(f"  Decoded: '{decoded}'")
+                    segment_num += 1
+                
+                elif seg['type'] == 'video_cube':
+                    print(f"\n[Segment {segment_num}] VIDEO CUBE {seg['cube_idx']}")
+                    print(f"  Cube bounds: {seg['cube_bounds']} (temporal tokens)")
+                    print(f"  Timestamp: {seg['timestamp']}")
+                    print(f"  Allocated positions: {seg['allocated_positions']}")
+                    print(f"  Token range: [{seg.get('token_start', '?')}, {seg.get('token_end', '?')}] ({seg['num_tokens']} tokens)")
+                    print(f"  Position range: [{seg.get('pos_start', 0):.4f}, {seg.get('pos_end', 0):.4f}]")
+                    print(f"  Position span: {seg.get('pos_end', 0) - seg.get('pos_start', 0):.4f}")
+                    
+                    # 显示前几个和后几个位置
+                    sample_positions = []
+                    token_start = seg.get('token_start', 0)
+                    for k in range(min(3, seg['num_tokens'])):
+                        pos = position_ids[0, i, token_start + k].item()
+                        sample_positions.append(f"{pos:.4f}")
+                    
+                    if seg['num_tokens'] > 6:
+                        sample_positions.append("...")
+                    
+                    for k in range(max(0, seg['num_tokens'] - 3), seg['num_tokens']):
+                        pos = position_ids[0, i, token_start + k].item()
+                        sample_positions.append(f"{pos:.4f}")
+                    
+                    print(f"  Sample positions: [{', '.join(sample_positions)}]")
+                    segment_num += 1
+                
+                elif seg['type'] == 'video_end':
+                    print(f"\n[Segment {segment_num}] <|video_end|>")
+                    print(f"  Token index: {seg['token_idx']}")
+                    print(f"  Position ID: {seg['position']}")
+                    segment_num += 1
+            
+            print(f"\n{'='*80}")
+            print(f"[DEBUG RoPE] Batch {i} Summary")
+            print(f"  Total segments: {len(segment_records)}")
+            print(f"  Final st_idx: {st_idx}")
+            print(f"  Max position used: {position_ids[0, i, :].max().item():.4f}")
+            print(f"{'='*80}\n")
+            
+            
+            # 计算 delta
             max_pos = position_ids[:, i, :].max()
             delta = max_pos + 1 - seq_len
             mrope_position_deltas.append(delta)
         
+        # 转换并返回
         mrope_position_deltas = torch.tensor(
             mrope_position_deltas,
             device=device,
-            dtype=torch.long
+            dtype=torch.float
         ).unsqueeze(1)
-
-        # print(f"[DEBUG]pos_ids:{position_ids}")
         
         return position_ids, mrope_position_deltas
+    
+    def _safe_decode(self, token_ids):
+        """安全解码 token IDs"""
+        try:
+            if hasattr(self, '_debug_tokenizer') and self._debug_tokenizer is not None:
+                return self._debug_tokenizer.decode(token_ids, skip_special_tokens=False)
+            else:
+                return f"<token_ids: {token_ids[:10]}{'...' if len(token_ids) > 10 else ''}>"
+        except Exception as e:
+            return f"<decode_error: {str(e)}>"
+                
+    # def _allocate_cube_positions(
+    #     self,
+    #     video_metadata: Glm4vCubingVideoMetadata,
+    #     device: torch.device
+    # ) -> torch.Tensor:
+    #     """
+    #     为每个 video token 分配位置（相对于 video_start 的偏移）
+        
+    #     策略：按 cube 的帧数比例分配位置范围
+    #     """
+    #     cube_bounds = video_metadata.cube_bounds[0]
+    #     total_tokens = video_metadata.actual_num_tokens
+        
+    #     # 计算每个 cube 的帧数
+    #     cube_frames = []
+    #     for start_frame, end_frame in cube_bounds:
+    #         num_frames = end_frame - start_frame
+    #         cube_frames.append(num_frames)
+        
+    #     total_frames = sum(cube_frames)
+    #     num_cubes = len(cube_frames)
+        
+    #     # 按比例分配位置数
+    #     position_allocations = []
+    #     for num_frames in cube_frames:
+    #         allocated = int(round(total_tokens * num_frames / total_frames))
+    #         position_allocations.append(allocated)
+        
+    #     # 调整确保总和 = total_tokens
+    #     diff = total_tokens - sum(position_allocations)
+    #     if diff != 0:
+    #         position_allocations[-1] += diff
+        
+    #     # 计算边界
+    #     boundaries = [0]
+    #     for alloc in position_allocations:
+    #         boundaries.append(boundaries[-1] + alloc)
+        
+    #     # 为每个 cube 分配 tokens
+    #     tokens_per_cube = total_tokens // num_cubes
+    #     remaining = total_tokens % num_cubes
+        
+    #     # 生成位置（从 0 开始的相对位置）
+    #     all_positions = []
+        
+    #     for cube_idx in range(num_cubes):
+    #         # 当前 cube 的 token 数
+    #         if cube_idx < remaining:
+    #             current_tokens = tokens_per_cube + 1
+    #         else:
+    #             current_tokens = tokens_per_cube
+            
+    #         # 位置范围
+    #         start_pos = boundaries[cube_idx]
+    #         end_pos = boundaries[cube_idx + 1] - 1
+            
+    #         # 生成位置
+    #         if current_tokens > 0:
+    #             cube_pos = torch.linspace(
+    #                 start_pos, 
+    #                 end_pos, 
+    #                 current_tokens,
+    #                 device=device
+    #             )
+    #             all_positions.append(cube_pos)
+        
+    #     if len(all_positions) > 0:
+    #         positions = torch.cat(all_positions, dim=0)
+    #     else:
+    #         positions = torch.tensor([], dtype=torch.long, device=device)
+        
 
+    #     print(f"\n[DEBUG AllocatePos] ----- Start -----")
+    #     print(f"  Input total_tokens: {total_tokens}")
+    #     print(f"  Input cube_bounds: {cube_bounds}")
+    #     print(f"  Calculated cube_frames: {cube_frames}")
+    #     print(f"  Calculated total_frames: {total_frames}")
+    #     print(f"  Position allocations per cube: {position_allocations}")
+    #     print(f"  Calculated boundaries: {boundaries}")
+    #     print(f"  Final generated relative positions (first 64): {positions[:64]}")
+    #     print(f"  Final generated relative positions shape: {positions.shape}")
+    #     print(f"[DEBUG AllocatePos] ----- End -----")
+    #     return positions
 
-    def _allocate_cube_positions(
+    def _allocate_cube_position_counts(
         self,
         video_metadata: Glm4vCubingVideoMetadata,
-        device: torch.device
-    ) -> torch.Tensor:
-        """返回的是相对于 video 开始的偏移量"""
+        batch_idx: int,  # ← 新增参数：当前 batch 的索引
+    ) -> List[int]:
+        """
+        计算指定 batch item 的每个 cube 应该占用多少个位置（按帧数比例）
         
-        cube_bounds = video_metadata.cube_bounds[0]
+        Args:
+            video_metadata: 视频元数据
+            batch_idx: 当前 batch 的索引（0, 1, 2, ...）
+        
+        Returns:
+            List of position counts，例如: [58, 77, 57]
+        """
+        cube_bounds = video_metadata.cube_bounds[batch_idx]
         total_tokens = video_metadata.actual_num_tokens
 
-        print(f"[DEBUG] video_metadata.cube_bounds: {video_metadata.cube_bounds}")
-        print(f"[DEBUG] type: {type(video_metadata.cube_bounds)}")
-        
-        cube_bounds = video_metadata.cube_bounds[0]
-        print(f"[DEBUG] cube_bounds (after [0]): {cube_bounds}")
-        print(f"[DEBUG] type: {type(cube_bounds)}")
-    
-        cube_frames = []
-        for idx, (start_frame, end_frame) in enumerate(cube_bounds):
-            num_frames = end_frame - start_frame
-            print(f"[DEBUG] Cube {idx}: [{start_frame}, {end_frame}) → {num_frames} frames")
-            cube_frames.append(num_frames)
-        
-        print(f"[DEBUG] cube_frames: {cube_frames}")
-        
-        # ===== 计算每个 cube 的帧数 =====
+        # 关键修复：扣除 thumbnail 占用的 tokens
+        if video_metadata.use_thumbnail:
+            cube_total_tokens = total_tokens - video_metadata.thumbnail_num_queries
+        else:
+            cube_total_tokens = total_tokens
+
+        # 计算每个 cube 的帧数
         cube_frames = []
         for start_frame, end_frame in cube_bounds:
             num_frames = end_frame - start_frame
             cube_frames.append(num_frames)
-        
-        total_frames = sum(cube_frames)
-        num_cubes = len(cube_frames)
-        
-        # ===== 按比例分配位置数 =====
-        position_allocations = []
-        for num_frames in cube_frames:
-            allocated = int(round(total_tokens * num_frames / total_frames))
-            position_allocations.append(allocated)
-        
-        # ===== 调整确保总和 = total_tokens =====
-        diff = total_tokens - sum(position_allocations)
-        if diff != 0:
-            position_allocations[-1] += diff
-        
-        # ===== 计算边界 =====
-        boundaries = [0]
-        for alloc in position_allocations:
-            boundaries.append(boundaries[-1] + alloc)
-        
-        # ===== 为每个 cube 分配 tokens =====
-        tokens_per_cube = total_tokens // num_cubes
-        remaining = total_tokens % num_cubes
-        
-        # ===== 生成位置（从 0 开始的相对位置）=====
-        all_positions = []
-        
-        for cube_idx in range(num_cubes):
-            # 当前 cube 的 token 数
-            if cube_idx < remaining:
-                current_tokens = tokens_per_cube + 1
-            else:
-                current_tokens = tokens_per_cube
-            
-            # 位置范围
-            start_pos = boundaries[cube_idx]
-            end_pos = boundaries[cube_idx + 1] - 1
-            
-            # 生成位置
-            if current_tokens > 0:
-                cube_pos = torch.linspace(
-                    start_pos, 
-                    end_pos, 
-                    current_tokens,
-                    device=device
-                ).long()
-                all_positions.append(cube_pos)
-        
-        if len(all_positions) > 0:
-            positions = torch.cat(all_positions, dim=0)
-        else:
-            positions = torch.tensor([], dtype=torch.long, device=device)
-        
-        return positions
 
-    # ==========  get_video_features returns metadata ==========
+        total_frames = sum(cube_frames)
+
+        # 按帧数比例分配位置（使用 cube_total_tokens 而非 total_tokens）
+        position_counts = []
+        for num_frames in cube_frames:
+            allocated = int(round(cube_total_tokens * num_frames / total_frames))
+            position_counts.append(allocated)
+        
+        # 调整确保总和 = total_tokens
+        diff = cube_total_tokens - sum(position_counts)
+        if diff != 0:
+            position_counts[-1] += diff
+        
+        print(f"\n[DEBUG AllocatePositionCounts] Batch {batch_idx}:")
+        print(f"  Total tokens: {total_tokens}")
+        print(f"  Cube total tokens: {cube_total_tokens}") 
+        print(f"  Cube frames: {cube_frames}")
+        print(f"  Position counts: {position_counts}")
+        
+        return position_counts
+
+    def _compute_cube_timestamps(
+        self,
+        cube_bounds: List[Tuple[int, int]],
+        video_start_token: int,
+        temporal_patch_size: int,
+        fps: float,
+    ) -> List[str]:
+        """
+        计算每个 cube 的起始时间戳
+        
+        Args:
+            cube_bounds: Cube 边界（temporal token 索引，相对于视频开始）
+                例如: [(0, 3), (3, 7), (7, 10)]
+            video_start_token: 该视频在全局的起始**原始帧**索引
+                例如: 0（第一个视频）或 40（第二个视频从第 40 帧开始）
+            temporal_patch_size: 时间维度的 patch 大小
+                例如: 2
+            fps: 有效帧率（已考虑 temporal_patch_size）
+                例如: 1.0
+        
+        Returns:
+            时间戳字符串列表
+                例如: ["0000.0", "0007.0", "0014.0"]
+        """
+        timestamps = []
+        
+        # 重建原始 FPS
+        original_fps = fps * temporal_patch_size
+        
+        print(f"[DEBUG _compute_timestamps] Inputs:")
+        print(f"  cube_bounds: {cube_bounds}")
+        print(f"  video_start_token (original frame): {video_start_token}")
+        print(f"  temporal_patch_size: {temporal_patch_size}")
+        print(f"  effective fps: {fps}")
+        print(f"  reconstructed original_fps: {original_fps}")
+        
+        for cube_idx, (start_token, end_token) in enumerate(cube_bounds):
+            # start_token 是相对于视频开始的 temporal token 索引
+            # 转换为绝对原始帧索引
+            abs_frame = video_start_token + start_token * temporal_patch_size
+            
+            # 转换为秒数
+            seconds = abs_frame / original_fps
+            
+            # 格式化
+            timestamp_str = self._format_timestamp(seconds)
+            timestamps.append(timestamp_str)
+            
+            print(f"[DEBUG _compute_timestamps] Cube {cube_idx}:")
+            print(f"  start_token (relative): {start_token}")
+            print(f"  abs_frame: {abs_frame}")
+            print(f"  seconds: {seconds:.1f}")
+            print(f"  formatted: {timestamp_str}")
+        
+        return timestamps
+
+    def _format_timestamp(self, seconds: float) -> str:
+        """
+        格式化时间戳为固定长度字符串
+        
+        Args:
+            seconds: 秒数（浮点数）
+        
+        Returns:
+            固定格式字符串 "0000.0"
+        
+        Examples:
+            0.0   -> "0000.0"
+            3.5   -> "0003.5"
+            123.7 -> "0123.7"
+        """
+        return f"{seconds:06.1f}"
+
     def get_video_features(
         self,
         pixel_values_videos: torch.FloatTensor,
         video_grid_thw: torch.LongTensor,
         videos_bound: Optional[list] = None,
+        tokenizer=None,  # ← 新增参数
     ) -> Tuple[tuple, Glm4vCubingVideoMetadata]:
         """
         Encodes videos into continuous embeddings
+        
+        Args:
+            pixel_values_videos: Video pixel values
+            video_grid_thw: Video grid dimensions
+            videos_bound: Frame boundaries
+            tokenizer: Tokenizer for encoding timestamps (required for cubing mode)
         
         Returns:
             video_embeds: tuple of tensors
             video_metadata: Glm4vCubingVideoMetadata object
         """
+        print(f"[DEBUG] pixel_values_videos shape: {pixel_values_videos.shape}")
+        print(f"[DEBUG] video_grid_thw: {video_grid_thw}")
+        
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
         
         video_metadata = Glm4vCubingVideoMetadata(
@@ -1421,17 +2104,16 @@ class Glm4vModel(Glm4vPreTrainedModel):
             mode="cubing" if self.config.use_cubing else "native",
             temporal_patch_size=self.config.vision_config.temporal_patch_size
         )
-
+        
         temporal_patch_size = self.config.vision_config.temporal_patch_size
-        if temporal_patch_size > 1 and videos_bound is not None:
-            videos_bound = [(start // temporal_patch_size, end // temporal_patch_size) 
-                            for start, end in videos_bound]
         
         if self.config.use_cubing:
+            # ✅ 传递 tokenizer
             video_embeds, video_metadata = self._get_video_features_with_cubing(
                 pixel_values_videos,
                 video_metadata,
-                videos_bound
+                videos_bound,
+                tokenizer=tokenizer  # ← 传递
             )
         else:
             video_embeds = self._get_video_features_native(
@@ -1439,7 +2121,6 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 video_metadata
             )
         
-        print(f"[FEATURES_DEBUG] video_embeds: {video_embeds[0].shape}")
         return video_embeds, video_metadata
 
     def _get_video_features_native(
@@ -1449,10 +2130,8 @@ class Glm4vModel(Glm4vPreTrainedModel):
     ) -> tuple:
         """Native GLM4V video processing"""
         temporal_patch_size = self.config.vision_config.temporal_patch_size
-        # flatten to frames
         flattened_grid_thw = video_metadata.to_flattened()
         
-        # Vision Encoder（include spatial merge）
         video_embeds = self.visual(
             pixel_values_videos,
             grid_thw=flattened_grid_thw,
@@ -1474,9 +2153,24 @@ class Glm4vModel(Glm4vPreTrainedModel):
         pixel_values_videos: torch.FloatTensor,
         video_metadata: Glm4vCubingVideoMetadata,
         videos_bound: Optional[list] = None,
+        video_fps: Optional[float] = None,
+        tokenizer=None,  # ← 新增参数
     ) -> Tuple[tuple, Glm4vCubingVideoMetadata]:
         """Video processing with Cubing technique"""
+        
+        # === Step 0: 验证 tokenizer ===
+        if tokenizer is None:
+            raise ValueError(
+                "Tokenizer is required for cubing mode with timestamps. "
+                "Please pass tokenizer to model.forward() or get_video_features()."
+            )
+        
+        # === 获取关键参数 ===
         temporal_patch_size = self.config.vision_config.temporal_patch_size
+        effective_fps = video_fps if video_fps is not None else self.config.effective_video_fps
+        
+        print(f"[DEBUG Timestamps] temporal_patch_size: {temporal_patch_size}")
+        print(f"[DEBUG Timestamps] effective_fps: {effective_fps}")
         
         if videos_bound is None:
             videos_bound = []
@@ -1486,51 +2180,86 @@ class Glm4vModel(Glm4vPreTrainedModel):
                 videos_bound.append((current_frame_idx, current_frame_idx + num_frames))
                 current_frame_idx += num_frames
 
-        # videos_bound_tokens = []
-        # for start_frame, end_frame in videos_bound:
-        #     start_token = start_frame // temporal_patch_size
-        #     end_token = end_frame // temporal_patch_size
-        #     videos_bound_tokens.append((start_token, end_token))
-        videos_bound_tokens = videos_bound
+        print(f"[DEBUG cube feat] videos_bound (patch): {videos_bound}")
         
-        # flatten
+        # ========== 原有逻辑 ========== 
         flattened_grid_thw = video_metadata.to_flattened()
 
-        # Step 1: Vision encoding
+        print("[DEBUG] get video features before visual")
         vision_features = self.visual(
             pixel_values_videos,
             grid_thw=flattened_grid_thw,
             return_before_merge=True
         )
+        print("[DEBUG] get video features after visual")
         
-        # Step 2: Reconstruct frames
         frame_features = self._reconstruct_frames(
             vision_features,
             video_metadata.original_grid_thw
         )
+
+        print(f"\n[DEBUG VERIFY] ===== Frame Features Verification =====")
+        print(f"  original_grid_thw: {video_metadata.original_grid_thw}")
+        print(f"  len(frame_features): {len(frame_features)}")
+        print(f"  Expected: {video_metadata.original_grid_thw[0, 0].item()}")
+        print(f"  temporal_patch_size: {temporal_patch_size}")
+        print(f"  Actual sampled frames (before temporal patch): {video_metadata.original_grid_thw[0, 0].item() * temporal_patch_size}")
+        print(f"  videos_bound (input): {videos_bound}")
         
-        # Step 3: Process each video
+        # 验证 videos_bound 的范围
+        if videos_bound is not None:
+            for video_idx, (vs, ve) in enumerate(videos_bound):
+                print(f"  Video {video_idx}: vs={vs}, ve={ve}, range={ve - vs}")
+                if ve > len(frame_features):
+                    print(f"    ❌ ERROR: ve ({ve}) > len(frame_features) ({len(frame_features)})")
+                    print(f"    This suggests videos_bound is in ORIGINAL FRAME level, not temporal token level!")
+                else:
+                    print(f"    ✅ OK: ve ({ve}) <= len(frame_features) ({len(frame_features)})")
+    
+        
         video_embeds_list = []
         all_cube_bounds = []
         all_gate_logits = []
+        all_cube_timestamps = []
+        all_cube_timestamp_tokens = []  # ← 新增：存储 tokenized 结果
         
-        for video_idx, (vs, ve) in enumerate(videos_bound_tokens):
+        for video_idx, (vs, ve) in enumerate(videos_bound):
             video_frames = torch.stack([
                 frame_features[i] for i in range(vs, ve)
             ])
             
-            # Cubing decision
+            print("[DEBUG] get cubing_result before cubing_module")
             cubing_result = self.cubing_module(
                 video_frames,
                 fpq=self.config.cubing_fpq,
                 temperature=self.config.cubing_temperature,
                 lr_gumbel=self._current_lr_gumbel,
             )
+            print(f"[DEBUG cube features] cubing_result: {cubing_result}")
             
             all_gate_logits.append(cubing_result['gate_logits'])
             all_cube_bounds.append(cubing_result['cube_bounds'])
             
-            # Process each cube
+            # === 计算时间戳 ===
+            cube_timestamps = self._compute_cube_timestamps(
+                cube_bounds=cubing_result['cube_bounds'],
+                video_start_token=0,
+                temporal_patch_size=temporal_patch_size,
+                fps=effective_fps,
+            )
+            all_cube_timestamps.append(cube_timestamps)
+            print(f"[DEBUG Timestamps] Video {video_idx} timestamps: {cube_timestamps}")
+            
+            # === 立即 tokenize 时间戳 ===
+            cube_timestamp_tokens = []
+            for ts_text in cube_timestamps:
+                ts_token_ids = tokenizer.encode(ts_text, add_special_tokens=False)
+                cube_timestamp_tokens.append(ts_token_ids)
+                print(f"[DEBUG Tokenize] '{ts_text}' → {ts_token_ids} ({len(ts_token_ids)} tokens)")
+            
+            all_cube_timestamp_tokens.append(cube_timestamp_tokens)
+            
+            # === Resampler 逻辑 ===
             cube_tokens = []
             h_patches = video_metadata.original_grid_thw[video_idx][1].item()
             w_patches = video_metadata.original_grid_thw[video_idx][2].item()
@@ -1538,19 +2267,20 @@ class Glm4vModel(Glm4vPreTrainedModel):
             for start, end in cubing_result['cube_bounds']:
                 cube = video_frames[start:end]
                 cube_flat = cube.reshape(-1, 1536)
-                
-                # Resampler
+
+                print("[DEBUG] get tokens before resampler")
                 tokens = self.resampler(
                     cube_flat,
                     tgt_size_range=[
                         [start, end],
                         [0, h_patches],
                         [0, w_patches]
-                    ]
+                    ],
+                    fps=effective_fps,
                 )
+                print(f"[DEBUG] resampled tokens: {tokens}")
                 cube_tokens.append(tokens)
             
-            # Optional: Add thumbnail
             if cubing_result['thumbnail'] is not None:
                 cube_tokens.insert(0, cubing_result['thumbnail'].unsqueeze(0))
             
@@ -1560,14 +2290,22 @@ class Glm4vModel(Glm4vPreTrainedModel):
         total_tokens = sum(v.shape[0] for v in video_embeds_list)
         video_metadata.actual_num_tokens = total_tokens
         video_metadata.cube_bounds = all_cube_bounds
+        video_metadata.cube_timestamps = all_cube_timestamps
+        video_metadata.cube_timestamp_tokens = all_cube_timestamp_tokens  # ← 存储 tokenized 结果
+
+        video_metadata.use_thumbnail = self.config.cubing_use_thumbnail
+        video_metadata.thumbnail_num_queries = getattr(
+            self.config, 'thumbnail_num_queries', 64
+)
         
-        # Save gate_logits for aux loss
         if self.training and all_gate_logits:
             self._last_gate_logits = torch.cat(all_gate_logits, dim=0)
+
+        print(f"[DEBUG features cubing] video_embeds_list: {len(video_embeds_list)}, {video_embeds_list[0].shape}")
+        print(f"[DEBUG features cubing] video_metadata: {video_metadata}")
         
         return tuple(video_embeds_list), video_metadata
 
-    # ========== _reconstruct_frames ==========
     def _reconstruct_frames(
         self,
         flat_features: torch.Tensor,
@@ -1575,27 +2313,19 @@ class Glm4vModel(Glm4vPreTrainedModel):
     ) -> list:
         """
         Reconstruct flattened features into frame format
-        
-        Args:
-            flat_features: [total_seq_len, 1536]
-            grid_thw: [[20, 24, 24]] - 原始视频级别格式
-        
-        Returns:
-            List of [h*w, 1536] tensors
         """
         frames = []
         start_idx = 0
-        temporal_patch_size = self.config.vision_config.temporal_patch_size
         
         for t, h, w in grid_thw:
-            num_temporal_tokens = t // temporal_patch_size
-            seq_len = num_temporal_tokens * h * w  # 10 × 24 × 24 = 5760
+            num_temporal_tokens = t 
+            seq_len = num_temporal_tokens * h * w
 
             feat = flat_features[start_idx:start_idx + seq_len]
-            feat = feat.reshape(num_temporal_tokens, h * w, -1)  # [10, 576, 1536]
+            feat = feat.reshape(num_temporal_tokens, h * w, -1)
             
             for frame_idx in range(num_temporal_tokens):
-                frames.append(feat[frame_idx])  # [576, 1536]
+                frames.append(feat[frame_idx])
             
             start_idx += seq_len
         
@@ -1654,127 +2384,567 @@ class Glm4vModel(Glm4vPreTrainedModel):
             )
 
         return special_image_mask, special_video_mask
-
+    
     @auto_docstring
     @can_return_tuple
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.LongTensor] = None,          # Shape [B, L_orig]
+        attention_mask: Optional[torch.Tensor] = None,         # Shape [B, L_orig] or dict
+        position_ids: Optional[torch.LongTensor] = None,       # Shape [3, B, L_orig] - Calculated by Collator, WE WILL IGNORE THIS
         past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,     # Shape [B, L_orig, D]
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         videos_bound: Optional[list] = None,
-        rope_deltas: Optional[torch.LongTensor] = None,
+        rope_deltas: Optional[torch.LongTensor] = None,       # Calculated by Collator, WE WILL RECALCULATE
         cache_position: Optional[torch.LongTensor] = None,
+        tokenizer=None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Glm4vModelOutputWithPast]:
-        r"""
-    Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            Indices of input sequence tokens.
+        self._debug_tokenizer = tokenizer
+        import torch.distributed as dist
         
-        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-            The temporal, height and width of feature shape of each image in LLM.
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
         
-        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-            The temporal, height and width of feature shape of each video in LLM.
+        actual_batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
         
-        videos_bound (`list`, *optional*):
-            Frame boundaries for each video, format: [(start, end), ...].
-        
-        rope_deltas (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            The rope index difference between sequence length and multimodal rope.
-            """
+        print(f"[RANK {rank}/{world_size}] Device: {device}, Batch size: {actual_batch_size}")
     
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        # ========== Step 1: 获取初始文本 Embeddings ==========
+        print(f"===STEP 1 Getting initial inputs and embeddings===")
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+            # print(f"\n[DEBUG NAN SRC] Checking expanded input_ids before embedding:")
+            # print(f"  Shape: {input_ids.shape}, dtype: {input_ids.dtype}")
+            # print(f"  Min ID: {input_ids.min()}, Max ID: {input_ids.max()}") # Check for invalid IDs
+            initial_inputs_embeds = self.get_input_embeddings()(input_ids) # Shape [B, L_orig, D]
+        else:
+            initial_inputs_embeds = inputs_embeds # Shape [B, L_orig, D]
+        # print(f"initial video_grid_thw: {video_grid_thw}")
 
+        print(f"\n[DEBUG] Initial Text Embeddings:")
+        print(f"  Shape: {initial_inputs_embeds.shape}, dtype: {initial_inputs_embeds.dtype}")
+        # print(f"  Has NaN: {torch.isnan(initial_inputs_embeds).any()}")
+        # print(f"  Has Inf: {torch.isinf(initial_inputs_embeds).any()}")
+
+        # ========== Step 2: 获取并插入图像特征 (如果存在) ==========
+        print(f"===STEP 2 Getting image features===")
+        # (假设图像特征已由 Plugin 正确插入或由 get_placeholder_mask 处理)
+        # 注意：如果图像也需要动态插入，此逻辑需要合并/调整
+        current_inputs_embeds = initial_inputs_embeds
         if pixel_values is not None:
+            # 假设 image 特征已通过 masked_scatter 插入 initial_inputs_embeds
+            # (省略 image 插入代码，假定它在前面已完成或在此处完成)
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(input_ids, inputs_embeds, image_features=image_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            image_embeds = torch.cat(image_embeds, dim=0).to(current_inputs_embeds.device, current_inputs_embeds.dtype)
+            # print(f"\n[DEBUG NAN SRC] Image Embeddings (before scatter):")
+            # print(f"  Shape: {image_embeds.shape}, dtype: {image_embeds.dtype}")
+            # print(f"  Has NaN: {torch.isnan(image_embeds).any()}")
+            # print(f"  Has Inf: {torch.isinf(image_embeds).any()}")
 
+            image_mask, _ = self.get_placeholder_mask(input_ids, current_inputs_embeds, image_features=image_embeds) # Assuming get_placeholder_mask works for images
+            current_inputs_embeds = current_inputs_embeds.masked_scatter(image_mask, image_embeds)
+            # print(f"[DEBUG FORWARD V2] Applied image features scatter.")
+            # print(f"\n[DEBUG NAN SRC] Embeddings After Image Scatter:")
+            # print(f"  Shape: {current_inputs_embeds.shape}, dtype: {current_inputs_embeds.dtype}")
+            # print(f"  Has NaN: {torch.isnan(current_inputs_embeds).any()}")
+            # print(f"  Has Inf: {torch.isinf(current_inputs_embeds).any()}")
+
+
+        # ========== Step 3: 获取视频特征 ==========
+        print(f"===STEP 3 Getting video features===")
+        video_embeds_list = []
         video_metadata = None
+        actual_num_video_tokens = 0
+
         if pixel_values_videos is not None:
-            video_embeds, video_metadata = self.get_video_features(
+            # ✅ 传递 tokenizer
+            video_embeds_tuple, video_metadata = self.get_video_features(
                 pixel_values_videos,
                 video_grid_thw,
-                videos_bound=videos_bound
-            )
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds, video_features=video_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-
-        if position_ids is None:
-            attention_mask_tensor = (
-                attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
-            )
-            if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
-                attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
-                if attention_mask_tensor.dtype.is_floating_point:
-                    attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
-                    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
-
-            prefill_compiled_stage = is_torchdynamo_compiling() and (
-                (input_ids is not None and input_ids.shape[1] != 1)
-                or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
-            )
-            prefill_noncompiled_stage = not is_torchdynamo_compiling() and (
-                (cache_position is not None and cache_position[0] == 0)
-                or (past_key_values is None or past_key_values.get_seq_length() == 0)
+                videos_bound=videos_bound,
+                # tokenizer=kwargs.get('tokenizer'),  # ← 从 kwargs 获取
+                tokenizer=tokenizer
             )
             
-            if (prefill_compiled_stage or prefill_noncompiled_stage) or self.rope_deltas is None:
-                position_ids, rope_deltas = self.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
-                    video_metadata=video_metadata,  # ← 传入 metadata
-                    attention_mask=attention_mask_tensor,
-                )
-                self.rope_deltas = rope_deltas
+            video_embeds_list = [v.to(current_inputs_embeds.device, current_inputs_embeds.dtype) for v in video_embeds_tuple]
+            actual_num_video_tokens = video_embeds_list[0].shape[0]
+            print(f"[DEBUG FORWARD V2] Got video features. Actual video tokens: {actual_num_video_tokens}")
+            print(f"  Video metadata: {video_metadata}")
+
+        # ========== Step 4: 动态构建最终 Embeddings 和 Mask ==========
+        print(f"===STEP 4 Building final embeddings and masks===")
+
+        if video_embeds_list:
+            video_start_embed = self.get_input_embeddings()(
+                torch.tensor(self.config.video_start_token_id, device=current_inputs_embeds.device)
+            ).unsqueeze(0)
+            
+            video_end_embed = self.get_input_embeddings()(
+                torch.tensor(self.config.video_end_token_id, device=current_inputs_embeds.device)
+            ).unsqueeze(0)
+            
+            final_inputs_embeds_list = []
+            final_attention_mask_list = []
+            batch_size, original_seq_len = input_ids.shape
+            video_placeholder_id = self.config.video_token_id
+            device = input_ids.device
+            
+            for i in range(batch_size):
+                video_positions = (input_ids[i] == video_placeholder_id).nonzero(as_tuple=True)[0]
+
+                if len(video_positions) == 0:
+                    final_inputs_embeds_list.append(current_inputs_embeds[i])
+                    final_attention_mask_list.append(
+                        attention_mask[i] if attention_mask is not None 
+                        else torch.ones(original_seq_len, device=device)
+                    )
+                    continue
+                
+                if len(video_positions) > 1:
+                    print(f"[WARNING STEP4] Multiple video placeholders in batch {i}, using first one")
+
+                video_pos = video_positions[0].item()
+                current_video_embeds = video_embeds_list[i]  # [num_video_tokens, D]
+                
+                # === 获取时间戳信息 ===
+                cube_timestamps = video_metadata.cube_timestamps[i]
+                cube_timestamp_tokens = video_metadata.cube_timestamp_tokens[i]  # ← 使用预计算的 tokens
+                num_cubes = len(cube_timestamps)
+                tokens_per_cube = current_video_embeds.shape[0] // num_cubes
+                
+                # === ✅ 直接使用预计算的 token IDs ===
+                timestamp_embeds_list = []
+                timestamp_token_counts = []
+                
+                for ts_token_ids in cube_timestamp_tokens:
+                    ts_embeds = self.get_input_embeddings()(
+                        torch.tensor(ts_token_ids, device=device)
+                    )
+                    timestamp_embeds_list.append(ts_embeds)
+                    timestamp_token_counts.append(len(ts_token_ids))
+                
+                print(f"[DEBUG Step4] Timestamp token counts: {timestamp_token_counts}")
+                
+                # === ✅ 检查是否有 thumbnail
+                if video_metadata.use_thumbnail:
+                    has_thumbnail = True
+                    thumbnail_num_tokens = video_metadata.thumbnail_num_queries
+                    thumbnail_embeds = current_video_embeds[0:thumbnail_num_tokens]  # 前 64 个
+                    cube_offset = thumbnail_num_tokens  # 后续 cubes 从这里开始
+                else:
+                    has_thumbnail = False
+                    thumbnail_num_tokens = 0
+                    cube_offset = 0
+
+                # 计算每个 cube 的 token 数
+                num_cube_tokens = current_video_embeds.shape[0] - cube_offset
+                tokens_per_cube = num_cube_tokens // num_cubes
+
+                # === 构建 embeddings 序列 ===
+                parts = [
+                    current_inputs_embeds[i, :video_pos],
+                    video_start_embed,
+                ]
+
+                # 插入 Thumbnail（如果存在）
+                if has_thumbnail:
+                    parts.append(thumbnail_embeds)
+                    print(f"[DEBUG Step4 Thumbnail] Added thumbnail: {thumbnail_embeds.shape}")
+
+                # 插入 Cubes
+                for cube_idx in range(num_cubes):
+                    parts.append(timestamp_embeds_list[cube_idx])  # 时间戳
+                    
+                    cube_start = cube_offset + cube_idx * tokens_per_cube
+                    cube_end = cube_start + tokens_per_cube
+                    parts.append(current_video_embeds[cube_start:cube_end])  # 64 个 video tokens
+
+                parts.extend([
+                    video_end_embed,
+                    current_inputs_embeds[i, video_pos + 1:]
+                ])
+
+                new_embeds = torch.cat(parts, dim=0)
+                final_inputs_embeds_list.append(new_embeds)
+                
+                # === 同步构建 attention_mask ===
+                if attention_mask is not None:
+                    current_mask = attention_mask[i]
+                    
+                    mask_parts = [
+                        current_mask[:video_pos],
+                        torch.ones(1, dtype=current_mask.dtype, device=device),  # video_start
+                    ]
+
+                    # ✅ Thumbnail mask
+                    if has_thumbnail:
+                        mask_parts.append(
+                            torch.ones(thumbnail_num_tokens, dtype=current_mask.dtype, device=device)
+                        )
+
+                    # Cubes mask
+                    for cube_idx in range(num_cubes):
+                        num_ts_tokens = timestamp_token_counts[cube_idx]
+                        mask_parts.append(torch.ones(num_ts_tokens, dtype=current_mask.dtype, device=device))
+                        mask_parts.append(torch.ones(tokens_per_cube, dtype=current_mask.dtype, device=device))
+                        
+                    mask_parts.extend([
+                        torch.ones(1, dtype=current_mask.dtype, device=device),  # video_end
+                        current_mask[video_pos + 1:]
+                    ])
+                    
+                    new_mask = torch.cat(mask_parts, dim=0)
+                    final_attention_mask_list.append(new_mask)
+                    
+                    assert new_mask.shape[0] == new_embeds.shape[0], \
+                        f"Mask length {new_mask.shape[0]} != Embeds length {new_embeds.shape[0]}"
+                    
+                    print(f"[DEBUG Step4] Batch {i}: new_embeds={new_embeds.shape[0]}, new_mask={new_mask.shape[0]}")
+                else:
+                    new_len = new_embeds.shape[0]
+                    final_attention_mask_list.append(
+                        torch.ones(new_len, dtype=torch.long, device=device)
+                    )
+            
+            # === Padding ===
+            max_len_new = max(embed.shape[0] for embed in final_inputs_embeds_list)
+            
+            final_inputs_embeds = torch.zeros(
+                batch_size, max_len_new, current_inputs_embeds.shape[2], 
+                dtype=current_inputs_embeds.dtype, 
+                device=device
+            )
+            
+            final_attention_mask = torch.zeros(
+                batch_size, max_len_new, 
+                dtype=torch.long, 
+                device=device
+            )
+            
+            for i in range(batch_size):
+                seq_len_i = final_inputs_embeds_list[i].shape[0]
+                final_inputs_embeds[i, :seq_len_i] = final_inputs_embeds_list[i]
+                final_attention_mask[i, :seq_len_i] = final_attention_mask_list[i]
+            
+            print(f"[DEBUG Step4] Final shapes:")
+            print(f"  final_inputs_embeds: {final_inputs_embeds.shape}")
+            print(f"  final_attention_mask: {final_attention_mask.shape}")
+
+        else:
+            final_inputs_embeds = current_inputs_embeds
+            final_attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids)
+            max_len_new = final_inputs_embeds.shape[1]
+            
+        # ========== Step 5: 重新计算 Position IDs ==========
+        print(f"===STEP 5 Recalculating Position IDs===")
+
+        final_position_ids = None
+        final_rope_deltas = None
+
+        if video_embeds_list:
+            actual_num_video_tokens_per_video_recalc = [v.shape[0] for v in video_embeds_list]
+            
+            temp_input_ids = torch.full(
+                (batch_size, max_len_new), 
+                self.config.pad_token_id or 0, 
+                dtype=torch.long, 
+                device=device
+            )
+
+            video_placeholder_id = self.config.video_token_id
+            video_start_token_id = self.config.video_start_token_id
+            video_end_token_id = self.config.video_end_token_id
+
+            for i in range(batch_size):
+                original_len_i = input_ids[i].shape[0]
+                video_positions = (input_ids[i] == video_placeholder_id).nonzero(as_tuple=True)[0]
+                
+                if len(video_positions) > 0:
+                    video_pos_orig = video_positions[0].item()
+                    
+                    cube_timestamps = video_metadata.cube_timestamps[i]
+                    cube_timestamp_tokens = video_metadata.cube_timestamp_tokens[i]  # ← 使用预计算的 tokens
+                    num_cubes = len(cube_timestamps)
+                    num_video_tokens_inserted = actual_num_video_tokens_per_video_recalc[i]
+                    
+                    # Calc offsets
+                    if video_metadata.use_thumbnail:
+                        has_thumbnail = True
+                        thumbnail_num_tokens = video_metadata.thumbnail_num_queries
+                        cube_offset = thumbnail_num_tokens
+                    else:
+                        has_thumbnail = False
+                        thumbnail_num_tokens = 0
+                        cube_offset = 0
+
+                    num_cube_tokens = num_video_tokens_inserted - cube_offset
+                    tokens_per_cube = num_cube_tokens // num_cubes
+
+                    # === 构建 temp_input_ids ===
+                    parts = []
+
+                    # 前面部分
+                    parts.append(input_ids[i, :video_pos_orig])
+
+                    # <|video_start|>
+                    parts.append(torch.tensor([video_start_token_id], device=device))
+
+                    # ✅ Thumbnail
+                    if has_thumbnail:
+                        parts.append(
+                            torch.full((thumbnail_num_tokens,), video_placeholder_id, device=device)
+                        )
+
+                    # Cubes: timestamp + video tokens
+                    for cube_idx in range(num_cubes):
+                        # Timestamp
+                        ts_token_ids = cube_timestamp_tokens[cube_idx]
+                        parts.append(torch.tensor(ts_token_ids, device=device))
+                        
+                        print(f"[DEBUG Step5] Cube {cube_idx} timestamp '{cube_timestamps[cube_idx]}' "
+                            f"→ {len(ts_token_ids)} tokens: {ts_token_ids}")
+                        
+                        # Video tokens
+                        parts.append(torch.full((tokens_per_cube,), video_placeholder_id, device=device))
+
+                    # <|video_end|>
+                    parts.append(torch.tensor([video_end_token_id], device=device))
+
+                    # 后面部分
+                    orig_after_start = video_pos_orig + 1
+                    parts.append(input_ids[i, orig_after_start:])
+
+                    # 拼接
+                    temp_seq = torch.cat(parts)
+                    
+                    # 验证长度
+                    expected_len = final_attention_mask[i].sum().item()
+                    actual_len = temp_seq.shape[0]
+                    
+                    print(f"[DEBUG Step5] Batch {i}: temp_seq length={actual_len}, expected={expected_len}")
+                    
+                    if actual_len <= max_len_new:
+                        temp_input_ids[i, :actual_len] = temp_seq
+                    else:
+                        print(f"[ERROR Step5] temp_seq too long! Truncating from {actual_len} to {max_len_new}")
+                        temp_input_ids[i, :] = temp_seq[:max_len_new]
+                
+                else:
+                    temp_input_ids[i, :original_len_i] = input_ids[i]
+            
+            # 验证
+            assert temp_input_ids.shape == final_attention_mask.shape, \
+                f"Shape mismatch: temp_input_ids {temp_input_ids.shape} != attention_mask {final_attention_mask.shape}"
+            
+            # 调用 get_rope_index
+            final_position_ids, final_rope_deltas = self.get_rope_index(
+                input_ids=temp_input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                video_metadata=video_metadata,
+                attention_mask=final_attention_mask
+            )
+            
+            print(f"[DEBUG STEP5] Profill Stage position_ids shape: {final_position_ids.shape}")
+
+        else:
+            # Decode Stage
+            seq_len = final_inputs_embeds.shape[1]
+            batch_size = final_inputs_embeds.shape[0]
+            
+            if past_key_values is not None:
+                try:
+                    if len(past_key_values) > 0 and len(past_key_values[0]) > 0:
+                        past_len = past_key_values[0][0].shape[2]
+                except:
+                    past_len = 0
+                start_pos = past_len
             else:
-                batch_size, seq_length, _ = inputs_embeds.shape
-                delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
-                    if cache_position is not None
-                    else 0
+                start_pos = 0
+
+            final_position_ids = torch.arange(
+                start_pos, start_pos + seq_len,
+                device=final_inputs_embeds.device,
+                dtype=torch.long
+            ).view(1, 1, -1).expand(3, batch_size, -1)
+
+            final_rope_deltas = torch.zeros(
+                batch_size, 1,
+                device=final_inputs_embeds.device,
+                dtype=torch.long
+            )
+            
+            print(f"[DEBUG STEP5] Decode position_ids: shape={final_position_ids.shape}, value={start_pos}")
+
+        # ========== Step 6: 调用 language_model ==========
+        print(f"===STEP 6 Calling Language Model===")
+    
+        # Reconstruct attention_mask for decode stage
+        # 修复：从 position_ids 获取 past_len
+        if past_key_values is not None and not video_embeds_list:
+            # Decode 阶段
+            # position_ids[0, 0, 0] 的值就是 past_length
+            past_len = final_position_ids[0, 0, 0].item()
+            
+            correct_len = past_len + final_inputs_embeds.shape[1]
+            current_len = final_attention_mask.shape[1]
+            
+            print(f"[FIX] past_len from position_ids: {past_len}")
+            print(f"[FIX] current_len: {current_len}, correct_len: {correct_len}")
+            
+            if current_len != correct_len:
+                print(f"[FIX] Rebuilding attention_mask: {current_len} → {correct_len}")
+                
+                final_attention_mask = torch.ones(
+                    final_inputs_embeds.shape[0],
+                    correct_len,
+                    dtype=torch.long,
+                    device=final_inputs_embeds.device
                 )
-                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                if cache_position is not None:
-                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
-                position_ids = position_ids.add(delta)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                
+                print(f"[FIX] Fixed attention_mask shape: {final_attention_mask.shape}")
+
+
+        # 确保 position_ids 最终形状正确 [3, B, L_new]
+        if final_position_ids is None or final_position_ids.shape[2] != final_inputs_embeds.shape[1]:
+            raise RuntimeError(f"Final position_ids shape {final_position_ids.shape if final_position_ids is not None else 'None'} "
+                              f"mismatched with final inputs_embeds seq length {final_inputs_embeds.shape[1]}")
+
+        # print(f"\n[DEBUG NAN] === Before language_model ===")
+        # print(f"  final_inputs_embeds shape: {final_inputs_embeds.shape}, dtype: {final_inputs_embeds.dtype}")
+        # print(f"  final_inputs_embeds has NaN: {torch.isnan(final_inputs_embeds).any()}")
+        # print(f"  final_inputs_embeds has Inf: {torch.isinf(final_inputs_embeds).any()}")
+        # Check value range (convert to float32 for stable min/max/mean)
+        if not torch.isnan(final_inputs_embeds).any() and not torch.isinf(final_inputs_embeds).any():
+             embeds_float = final_inputs_embeds.float()
+             print(f"  final_inputs_embeds Range: min={embeds_float.min():.4f}, max={embeds_float.max():.4f}, mean={embeds_float.mean():.4f}")
+
+        print(f"  final_position_ids shape: {final_position_ids.shape}, dtype: {final_position_ids.dtype}")
+        torch.set_printoptions(threshold=10000)
+        # print(f"  final_position_ids: {final_position_ids}")
+        # Position IDs are indices, usually don't cause NaN directly unless used incorrectly
+
+        print(f"  final_attention_mask shape: {final_attention_mask.shape}, dtype: {final_attention_mask.dtype}")
+        # Attention mask is usually 0/1, unlikely source of NaN
 
         outputs = self.language_model(
             input_ids=None,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
+            position_ids=final_position_ids,     # <--- 使用新计算的 position_ids
+            attention_mask=final_attention_mask, # <--- 使用新计算的 attention_mask
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=final_inputs_embeds,   # <--- 使用动态构建的 embeds
             cache_position=cache_position,
             **kwargs,
         )
+
+        if outputs.past_key_values is not None:
+            new_kv_len = outputs.past_key_values[0][0].shape[2] if len(outputs.past_key_values) > 0 else 0
+            print(f"  Output KV cache length: {new_kv_len}")
+        else:
+            print(f"  ⚠️ Output has no KV cache!")
+
+
+        # llm_output_hidden_state = outputs.last_hidden_state
+        # print(f"\n[DEBUG NAN] === After language_model ===")
+        # print(f"  LLM output shape: {llm_output_hidden_state.shape}, dtype: {llm_output_hidden_state.dtype}")
+        # print(f"  LLM output has NaN: {torch.isnan(llm_output_hidden_state).any()}")
+        # print(f"  LLM output has Inf: {torch.isinf(llm_output_hidden_state).any()}")
+        # if not torch.isnan(llm_output_hidden_state).any() and not torch.isinf(llm_output_hidden_state).any():
+        #      llm_output_float = llm_output_hidden_state.float()
+        #      print(f"  LLM output Range: min={llm_output_float.min():.4f}, max={llm_output_float.max():.4f}, mean={llm_output_float.mean():.4f}")
 
         return Glm4vModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=self.rope_deltas,
+            rope_deltas=final_rope_deltas, # <--- 使用新计算的 rope_deltas
         )
 
+    def _expand_video_placeholders(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        video_metadata: Glm4vCubingVideoMetadata,
+    ) -> Tuple[torch.LongTensor, Optional[torch.Tensor]]:
+        """
+        将 input_ids 中的单个 <|video|> token 扩展为 video_metadata.actual_num_tokens 个
+        video_token_id，并相应扩展 attention_mask。进行 Padding。
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
 
+        # 假设 video_metadata 对应整个 batch (或需要按 batch item 索引)
+        # 这里简化为假设 batch size=1 或所有样本视频 token 数相同
+        actual_tokens = video_metadata.actual_num_tokens
+        video_token_id = self.config.video_token_id # 要重复插入的 ID
+        pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else 0
+
+
+        expanded_input_ids_list = []
+        expanded_attention_mask_list = [] if attention_mask is not None else None
+
+        for i in range(batch_size):
+            video_positions = (input_ids[i] == video_token_id).nonzero(as_tuple=True)[0]
+
+            if len(video_positions) == 0:
+                expanded_input_ids_list.append(input_ids[i])
+                if attention_mask is not None:
+                    expanded_attention_mask_list.append(attention_mask[i])
+                continue
+
+            # 假设只有一个 video placeholder
+            video_pos = video_positions[0].item()
+
+            expanded_ids = torch.cat([
+                input_ids[i, :video_pos],
+                torch.full((actual_tokens,), video_token_id, dtype=input_ids.dtype, device=device),
+                input_ids[i, video_pos+1:]
+            ])
+            expanded_input_ids_list.append(expanded_ids)
+
+            if attention_mask is not None:
+                expanded_mask = torch.cat([
+                    attention_mask[i, :video_pos],
+                    torch.ones(actual_tokens, dtype=attention_mask.dtype, device=device),
+                    attention_mask[i, video_pos+1:]
+                ])
+                expanded_attention_mask_list.append(expanded_mask)
+
+        # Padding
+        max_len = max(ids.shape[0] for ids in expanded_input_ids_list)
+
+        padded_input_ids = torch.stack([
+            F.pad(ids, (0, max_len - ids.shape[0]), value=pad_token_id)
+            for ids in expanded_input_ids_list
+        ])
+
+        padded_attention_mask = None
+        if attention_mask is not None:
+            padded_attention_mask = torch.stack([
+                F.pad(mask, (0, max_len - mask.shape[0]), value=0) # Pad mask with 0
+                for mask in expanded_attention_mask_list
+            ])
+
+        # print(f"[DEBUG EXPAND] Expanded input_ids shape: {padded_input_ids.shape}")
+        # if padded_attention_mask is not None:
+        #      print(f"[DEBUG EXPAND] Expanded attention_mask shape: {padded_attention_mask.shape}")
+
+        return padded_input_ids, padded_attention_mask
+        
 @dataclass
 @auto_docstring(
     custom_intro="""
@@ -1801,14 +2971,26 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
 
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """
+        重写 from_pretrained 以自动初始化 Cubing 模块
+        """
+        # 调用父类的 from_pretrained
+        model = super().from_pretrained(*args, **kwargs)
+        
+        # 自动初始化 Cubing 模块（如果需要）
+        if hasattr(model, 'model') and hasattr(model.model, 'initialize_cubing_modules_if_needed'):
+            model.model.initialize_cubing_modules_if_needed()
+        
+        return model
+    
+
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
-
-    def set_decoder(self, decoder):
-        self.model.set_decoder(decoder)
 
     def get_decoder(self):
         return self.model.get_decoder()
@@ -1847,6 +3029,7 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        tokenizer=None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Glm4vCausalLMOutputWithPast]:
         r"""
@@ -1868,6 +3051,8 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
             The rope index difference between sequence length and multimodal rope.
 
         """
+        print(f"[DEBUG generation] videos_bound: {videos_bound}")
+        print(f"[DEBUG generation] video_grid_thw: {video_grid_thw}")
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -1880,6 +3065,7 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
+            tokenizer=tokenizer,
             **kwargs,
         )
 
@@ -1888,9 +3074,86 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        # print(f"\n[DEBUG NAN] === After lm_head (Logits) ===")
+        # print(f"  logits shape: {logits.shape}, dtype: {logits.dtype}")
+        # print(f"  logits has NaN: {torch.isnan(logits).any()}")
+        # print(f"  logits has Inf: {torch.isinf(logits).any()}")
+        if not torch.isnan(logits).any() and not torch.isinf(logits).any():
+             logits_float = logits.float()
+             print(f"  logits Range: min={logits_float.min():.4f}, max={logits_float.max():.4f}, mean={logits_float.mean():.4f}")
+
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+            original_seq_len = labels.shape[1] # L_orig (e.g., 24)
+            # print(f"[DEBUG LOSS]original_seq_len: {original_seq_len}")
+            new_seq_len = logits.shape[1]      # L_new (e.g., 343)
+            # print(f"[DEBUG LOSS]new_seq_len: {new_seq_len}")
+            batch_size = labels.shape[0]
+            device = labels.device
+            ignore_index = -100 # Standard ignore index for cross entropy
+
+            if original_seq_len != new_seq_len:
+                # print(f"[DEBUG LOSS] Expanding labels from {original_seq_len} to {new_seq_len}")
+                # We need to know where the video tokens were inserted.
+                # This requires finding the video placeholder in the ORIGINAL input_ids.
+                # Assuming input_ids (original) is available here, or passed through outputs
+                # Let's assume original input_ids ARE available as function argument `input_ids`
+                # (If not, this needs adjustment to get the original IDs)
+
+                if input_ids is None:
+                    raise RuntimeError("Original input_ids are required in Glm4vForConditionalGeneration.forward to expand labels correctly.")
+                if input_ids.shape[1] != original_seq_len:
+                    raise RuntimeError(f"Shape mismatch: labels length ({original_seq_len}) does not match original input_ids length ({input_ids.shape[1]})")
+
+
+                video_placeholder_id = self.config.video_token_id
+                num_tokens_to_insert = new_seq_len - original_seq_len + 1 # e.g., 343 - 24 + 1 = 320
+
+                labels_expanded = torch.full((batch_size, new_seq_len), ignore_index, dtype=labels.dtype, device=device)
+
+                for i in range(batch_size):
+                    video_positions = (input_ids[i] == video_placeholder_id).nonzero(as_tuple=True)[0]
+                    if len(video_positions) > 0:
+                        video_pos_orig = video_positions[0].item() # Position in original sequence
+
+                        # Copy labels before placeholder
+                        labels_expanded[i, :video_pos_orig] = labels[i, :video_pos_orig]
+                        # Video part is filled with ignore_index (already done by torch.full)
+                        # Copy labels after placeholder
+                        orig_after_start = video_pos_orig + 1
+                        new_after_start = video_pos_orig + num_tokens_to_insert
+                        len_after = original_seq_len - orig_after_start
+                        if len_after > 0:
+                                end_idx_new = min(new_after_start + len_after, new_seq_len)
+                                end_idx_orig = min(orig_after_start + len_after, original_seq_len)
+                                labels_expanded[i, new_after_start : end_idx_new] = labels[i, orig_after_start : end_idx_orig]
+                    else: # No video placeholder found in original input_ids
+                        # Copy original labels directly, padding the rest with ignore_index
+                        labels_expanded[i, :original_seq_len] = labels[i]
+
+                # Use the expanded labels for loss calculation
+                labels_to_use = labels_expanded
+                # print(f"[DEBUG LOSS] Using expanded labels shape: {labels_to_use.shape}")
+                # print(f"\n[DEBUG NAN] === Before loss_function ===")
+                # print(f"  logits shape (input to loss): {logits.shape}") # Should match above
+                # print(f"  labels_to_use shape (input to loss): {labels_to_use.shape}")
+                # print(f"  labels_to_use has values outside [-100, vocab_size-1]?: ",
+                    # f"min={labels_to_use.min()}, max={labels_to_use.max()}, vocab_size={self.config.text_config.vocab_size}")
+
+            else: # No expansion needed
+                labels_to_use = labels
+                print(f"[DEBUG LOSS] Using original labels shape: {labels_to_use.shape}")
+
+            if labels_to_use is not None:
+                # 假设 self.loss_function 处理 label shifting
+                loss = self.loss_function(logits=logits, labels=labels_to_use, vocab_size=self.config.text_config.vocab_size)
+                # print(f"[DEBUG NAN] === After loss_function ===")
+                # print(f"  Calculated loss value: {loss.item() if loss is not None else 'None'}")
+                # print(f"  Loss is NaN: {torch.isnan(loss).any() if loss is not None else 'N/A'}")
+                # print(f"  Loss is Inf: {torch.isinf(loss).any() if loss is not None else 'N/A'}")
+                print(f"[DEBUG LOSS] Calculated loss: {loss.item() if loss is not None else 'None'}")
+            else:
+                 print("[ERROR LOSS] labels_to_use is None, cannot calculate loss.")
 
             if self.config.use_cubing and self.training:
                 aux_loss = self.model.get_cubing_aux_loss(alpha=0.001)
@@ -1904,6 +3167,20 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
         )
+    
+    def loss_function(self, logits, labels, vocab_size, ignore_index=-100):
+        # Simplified version assuming standard cross entropy loss
+        # Shift logits and labels for next token prediction
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        shift_logits = shift_logits.view(-1, vocab_size)
+        shift_labels = shift_labels.view(-1)
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        # Calculate loss
+        loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=ignore_index)
+        return loss
 
     def prepare_inputs_for_generation(
         self,
@@ -2063,7 +3340,7 @@ class Glm4vForConditionalGeneration(Glm4vPreTrainedModel, GenerationMixin):
 
     def get_output_embeddings(self):
         """获取输出embedding层（lm_head）"""
-        return self.lm_headß
+        return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
         """设置输出embedding层"""
